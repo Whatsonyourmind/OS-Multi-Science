@@ -16,6 +16,10 @@ The conformal coverage guarantee is marginal: E[coverage] >= 1 - alpha
 over the randomness in the calibration/test split. We validate this by
 checking that the *mean* coverage across seeds meets the nominal level.
 
+When ``use_real_models=True`` (default), uses genuinely diverse model
+families from ``benchmarks.model_zoo`` trained on real datasets from
+``benchmarks.datasets``.
+
 Usage
 -----
     python experiments/q2_conformal_bounds.py
@@ -867,36 +871,312 @@ def print_results(agg: dict, all_results: list[dict]) -> str:
 
 
 # ===================================================================
+# Real-model approach: use genuine model families on real datasets
+# ===================================================================
+
+def run_single_experiment_real(
+    seed: int,
+    dataset_name: str = "breast_cancer",
+    alpha_levels: list[float] | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Run a single CRC experiment using real model zoo on a real dataset.
+
+    Parameters
+    ----------
+    seed : random seed.
+    dataset_name : name of classification dataset to use.
+    alpha_levels : list of miscoverage levels to test.
+    verbose : whether to print per-run details.
+
+    Returns
+    -------
+    Dictionary with all metrics from this run (same format as run_single_experiment).
+    """
+    from benchmarks.datasets import load_dataset
+    from benchmarks.model_zoo import (
+        build_classification_zoo,
+        train_zoo,
+        collect_predictions_classification,
+    )
+
+    if alpha_levels is None:
+        alpha_levels = [0.05, 0.10, 0.20]
+
+    rng = np.random.default_rng(seed)
+    icm_config = ICMConfig.wide_range_preset()
+
+    # ------------------------------------------------------------------
+    # (a) Load real dataset and split into train/calibration/test
+    # ------------------------------------------------------------------
+    X_train_full, X_test, y_train_full, y_test = load_dataset(
+        dataset_name, seed=seed, test_size=0.4,
+    )
+    # Further split test into calibration and test
+    n_total_eval = len(y_test)
+    n_cal = n_total_eval // 2
+    cal_idx = np.arange(n_cal)
+    test_idx = np.arange(n_cal, n_total_eval)
+
+    X_cal, y_cal = X_test[cal_idx], y_test[cal_idx]
+    X_test_final, y_test_final = X_test[test_idx], y_test[test_idx]
+
+    n_classes = len(np.unique(y_train_full))
+    n_samples = len(y_train_full) + n_total_eval
+
+    # ------------------------------------------------------------------
+    # (b) Build and train real model zoo
+    # ------------------------------------------------------------------
+    models = build_classification_zoo(seed=seed)
+    train_zoo(models, X_train_full, y_train_full)
+
+    # ------------------------------------------------------------------
+    # (c) Collect predictions on calibration and test sets
+    # ------------------------------------------------------------------
+    preds_cal = collect_predictions_classification(models, X_cal)
+    preds_test = collect_predictions_classification(models, X_test_final)
+
+    # ------------------------------------------------------------------
+    # (d) Compute ICM scores per sample
+    # ------------------------------------------------------------------
+    def _compute_icm_batch(preds_dict, n):
+        model_names = list(preds_dict.keys())
+        scores = np.empty(n)
+        for i in range(n):
+            sample_preds = {name: preds_dict[name][i] for name in model_names}
+            result = compute_icm_from_predictions(
+                sample_preds, config=icm_config, distance_fn="hellinger",
+            )
+            scores[i] = result.icm_score
+        return scores
+
+    icm_cal = _compute_icm_batch(preds_cal, len(y_cal))
+    icm_test = _compute_icm_batch(preds_test, len(y_test_final))
+
+    # ------------------------------------------------------------------
+    # (e) Compute actual loss (cross-entropy) per sample
+    # ------------------------------------------------------------------
+    ensemble_cal = ensemble_average_probs(preds_cal)
+    ensemble_test = ensemble_average_probs(preds_test)
+    L_cal = cross_entropy_loss(y_cal, ensemble_cal)
+    L_test = cross_entropy_loss(y_test_final, ensemble_test)
+
+    # All ICM/Loss for stats
+    icm_all = np.concatenate([icm_cal, icm_test])
+    loss_all = np.concatenate([L_cal, L_test])
+
+    # ------------------------------------------------------------------
+    # (f) Split calibration into fit and conformal halves
+    # ------------------------------------------------------------------
+    n_c = len(icm_cal)
+    mid = n_c // 2
+    perm = rng.permutation(n_c)
+    fit_idx_c = perm[:mid]
+    conf_idx_c = perm[mid:]
+
+    C_fit, L_fit = icm_cal[fit_idx_c], L_cal[fit_idx_c]
+    C_conf, L_conf = icm_cal[conf_idx_c], L_cal[conf_idx_c]
+
+    g_fitted = fit_isotonic(C_fit, L_fit)
+    L_pred_fit = g_fitted.predict(C_fit)
+    rmse_train = float(np.sqrt(np.mean((L_fit - L_pred_fit) ** 2)))
+    corr_train = float(np.corrcoef(C_fit, L_fit)[0, 1]) if len(C_fit) > 2 else 0.0
+
+    # ------------------------------------------------------------------
+    # (g) Conformalize at each alpha level and validate on test
+    # ------------------------------------------------------------------
+    conformal_results = {}
+    for alpha in alpha_levels:
+        g_alpha = conformalize(g_fitted, C_conf, L_conf, alpha=alpha)
+
+        g_alpha_test = g_alpha(icm_test)
+        covered = L_test <= g_alpha_test
+        empirical_coverage = float(np.mean(covered))
+        nominal_coverage = 1.0 - alpha
+        coverage_gap = empirical_coverage - nominal_coverage
+
+        L_pred_test = g_fitted.predict(icm_test)
+        avg_margin = float(np.mean(g_alpha_test - L_pred_test))
+        avg_bound = float(np.mean(g_alpha_test))
+
+        conformal_results[alpha] = {
+            "empirical_coverage": empirical_coverage,
+            "nominal_coverage": nominal_coverage,
+            "coverage_gap": coverage_gap,
+            "coverage_valid": empirical_coverage >= nominal_coverage,
+            "avg_bound": avg_bound,
+            "avg_margin": avg_margin,
+        }
+
+    # ------------------------------------------------------------------
+    # (h) Risk-coverage curve
+    # ------------------------------------------------------------------
+    thresholds_sweep = np.linspace(0.0, 1.0, 100)
+    rc_curve = risk_coverage_curve(icm_test, L_test, thresholds=thresholds_sweep)
+
+    valid_mask = ~np.isnan(rc_curve["avg_risk"])
+    if valid_mask.sum() > 1:
+        sorted_idx = np.argsort(rc_curve["coverage"][valid_mask])
+        cov_sorted = rc_curve["coverage"][valid_mask][sorted_idx]
+        risk_sorted = rc_curve["avg_risk"][valid_mask][sorted_idx]
+        rc_auc = float(np.trapezoid(risk_sorted, cov_sorted))
+    else:
+        rc_auc = float("nan")
+
+    # ------------------------------------------------------------------
+    # (i) Decision gate
+    # ------------------------------------------------------------------
+    tau_hi_adaptive = float(np.percentile(icm_all, 75))
+    tau_lo_adaptive = float(np.percentile(icm_all, 25))
+    crc_config_adaptive = CRCConfig(
+        tau_hi=tau_hi_adaptive,
+        tau_lo=tau_lo_adaptive,
+    )
+
+    g_alpha_default = conformalize(g_fitted, C_conf, L_conf, alpha=0.10)
+    decisions = []
+    for i in range(len(icm_test)):
+        re = compute_re(float(icm_test[i]), g_alpha_default)
+        dec = decision_gate(float(icm_test[i]), re, crc_config_adaptive)
+        decisions.append(dec)
+
+    decision_counts = {
+        DecisionAction.ACT: sum(1 for d in decisions if d == DecisionAction.ACT),
+        DecisionAction.DEFER: sum(1 for d in decisions if d == DecisionAction.DEFER),
+        DecisionAction.AUDIT: sum(1 for d in decisions if d == DecisionAction.AUDIT),
+    }
+    n_test_final = len(icm_test)
+    decision_fracs = {k: v / max(n_test_final, 1) for k, v in decision_counts.items()}
+
+    loss_by_decision = {}
+    for action in DecisionAction:
+        mask = np.array([d == action for d in decisions])
+        if mask.any():
+            loss_by_decision[action] = float(L_test[mask].mean())
+        else:
+            loss_by_decision[action] = float("nan")
+
+    # ------------------------------------------------------------------
+    # (j) calibrate_thresholds
+    # ------------------------------------------------------------------
+    np.random.seed(seed)
+    tau_hi_cal, tau_lo_cal = calibrate_thresholds(
+        icm_cal, L_cal, target_coverage=0.80, alpha=0.10,
+    )
+    cal_coverage = float(np.mean(icm_test >= tau_lo_cal))
+
+    # ------------------------------------------------------------------
+    # Standard predictions ICM stats (reuse as "icm_std_stats")
+    # ------------------------------------------------------------------
+    icm_std_stats = {
+        "mean": float(np.mean(icm_all)),
+        "std": float(np.std(icm_all)),
+        "min": float(np.min(icm_all)),
+        "max": float(np.max(icm_all)),
+    }
+
+    # ------------------------------------------------------------------
+    # Assemble results (same format as legacy run_single_experiment)
+    # ------------------------------------------------------------------
+    results = {
+        "seed": seed,
+        "n_samples": n_samples,
+        "n_classes": n_classes,
+        "n_train": len(y_train_full),
+        "n_cal": len(y_cal),
+        "n_test": n_test_final,
+        # ICM statistics
+        "icm_mean": float(np.mean(icm_all)),
+        "icm_std": float(np.std(icm_all)),
+        "icm_min": float(np.min(icm_all)),
+        "icm_max": float(np.max(icm_all)),
+        "icm_q25": float(np.percentile(icm_all, 25)),
+        "icm_q50": float(np.percentile(icm_all, 50)),
+        "icm_q75": float(np.percentile(icm_all, 75)),
+        "icm_std_stats": icm_std_stats,
+        # Loss statistics
+        "loss_mean": float(np.mean(loss_all)),
+        "loss_std": float(np.std(loss_all)),
+        "loss_min": float(np.min(loss_all)),
+        "loss_max": float(np.max(loss_all)),
+        # Isotonic fit quality
+        "rmse_train": rmse_train,
+        "corr_icm_loss": corr_train,
+        # Conformal results per alpha
+        "conformal": conformal_results,
+        # Risk-coverage curve
+        "rc_auc": rc_auc,
+        "rc_curve": rc_curve,
+        # Decision gate
+        "tau_hi_adaptive": tau_hi_adaptive,
+        "tau_lo_adaptive": tau_lo_adaptive,
+        "decision_fracs": {k.value: v for k, v in decision_fracs.items()},
+        "loss_by_decision": {k.value: v for k, v in loss_by_decision.items()},
+        # Calibrated thresholds
+        "tau_hi_calibrated": tau_hi_cal,
+        "tau_lo_calibrated": tau_lo_cal,
+        "calibrated_coverage": cal_coverage,
+    }
+
+    return results
+
+
+# ===================================================================
 # Main
 # ===================================================================
 
-def main() -> None:
+def main(use_real_models: bool = True) -> None:
+    """Run the Q2 conformal bounds experiment.
+
+    Parameters
+    ----------
+    use_real_models : bool
+        When True (default), use genuinely diverse model families from the
+        model zoo trained on real datasets.  When False, use the legacy
+        synthetic noise-perturbation approach.
+    """
     t_start = time.time()
 
     print("=" * 76)
     print("  Experiment Q2: Conformal Risk Bounds Validation")
     print("  OS Multi-Science Framework")
+    if use_real_models:
+        print("  (REAL MODEL ZOO + REAL DATASETS)")
     print("=" * 76)
-    print()
-    print("Configuration: n=5000, K=3 classes, M=5 models, 20 seeds")
-    print("Alpha levels: [0.05, 0.10, 0.20]")
     print()
 
     N_SEEDS = 20
     seeds = list(range(N_SEEDS))
     alpha_levels = [0.05, 0.10, 0.20]
 
+    if use_real_models:
+        print("Configuration: real datasets (breast_cancer), 8 model families, 20 seeds")
+    else:
+        print("Configuration: n=5000, K=3 classes, M=5 models, 20 seeds")
+    print("Alpha levels: [0.05, 0.10, 0.20]")
+    print()
+
     all_results = []
     for i, seed in enumerate(seeds):
         print(f"  Seed {seed+1:2d}/{N_SEEDS}...", end="", flush=True)
         t_seed = time.time()
-        result = run_single_experiment(
-            seed=seed,
-            n_samples=5000,
-            n_classes=3,
-            alpha_levels=alpha_levels,
-            verbose=False,
-        )
+
+        if use_real_models:
+            result = run_single_experiment_real(
+                seed=seed,
+                dataset_name="breast_cancer",
+                alpha_levels=alpha_levels,
+                verbose=False,
+            )
+        else:
+            result = run_single_experiment(
+                seed=seed,
+                n_samples=5000,
+                n_classes=3,
+                alpha_levels=alpha_levels,
+                verbose=False,
+            )
+
         elapsed = time.time() - t_seed
         coverages = [result["conformal"][a]["empirical_coverage"] for a in alpha_levels]
         valid_all = all(result["conformal"][a]["coverage_valid"] for a in alpha_levels)

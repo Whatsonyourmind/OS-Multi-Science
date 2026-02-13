@@ -750,5 +750,509 @@ def main():
     }
 
 
+# =====================================================================
+# Real-model variant: use actual model families per time window
+# =====================================================================
+
+def build_timeseries_predictions_real(
+    n_timesteps: int,
+    change_at: int,
+    shift_magnitude: float,
+    n_bins: int = 20,
+    seed: int = 42,
+) -> tuple[dict[str, NDArray], list[float], list[float]]:
+    """Create per-model prediction time series using real model families
+    trained on each time window, instead of noise-perturbed copies.
+
+    Uses a synthetic base signal with a distribution shift at change_at.
+    At each time step, trains lightweight real model families (DT, LR, KNN, RF)
+    on a small feature window and collects their predictions to compute ICM.
+
+    Returns
+    -------
+    predictions_dict_t : {model_name: array(T,)} point predictions
+    icm_scores         : list of ICM scores at each time step
+    pi_scores          : list of dependency-penalty scores at each step
+    """
+    from sklearn.linear_model import LinearRegression
+    from sklearn.tree import DecisionTreeRegressor
+    from sklearn.neighbors import KNeighborsRegressor
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+    rng = np.random.default_rng(seed)
+    config = ICMConfig.wide_range_preset()
+
+    # Generate a synthetic time series with distributional shift
+    t_axis = np.arange(n_timesteps, dtype=float)
+    base_signal = np.sin(2 * np.pi * t_axis / 100) * 0.3
+
+    # Features: lagged versions of the signal + noise
+    n_features = 5
+    X_all = np.column_stack([
+        np.roll(base_signal, i+1) + rng.normal(0, 0.05, n_timesteps)
+        for i in range(n_features)
+    ])
+    y_all = base_signal.copy()
+
+    # Inject shift post-change: features shift, making models disagree
+    shift_noise = rng.normal(0, 0.3 * shift_magnitude, (n_timesteps - change_at, n_features))
+    X_all[change_at:] += shift_noise
+    y_shift = rng.normal(0, 0.2 * shift_magnitude, n_timesteps - change_at)
+    y_all[change_at:] += y_shift
+
+    model_families = [
+        ("LinearReg", lambda s: LinearRegression()),
+        ("DecisionTree", lambda s: DecisionTreeRegressor(max_depth=5, random_state=s)),
+        ("KNN", lambda s: KNeighborsRegressor(n_neighbors=3)),
+        ("RandomForest", lambda s: RandomForestRegressor(n_estimators=20, max_depth=4, random_state=s)),
+        ("GradBoosting", lambda s: GradientBoostingRegressor(n_estimators=20, max_depth=2, random_state=s, learning_rate=0.1)),
+    ]
+    model_names = [name for name, _ in model_families]
+    n_models = len(model_families)
+
+    predictions_dict_t: dict[str, NDArray] = {name: np.zeros(n_timesteps) for name in model_names}
+
+    # Train window size
+    train_window = 30
+
+    # Shared grid for probability distributions (for Hellinger)
+    grid_lo = float(np.min(y_all)) - 2.0
+    grid_hi = float(np.max(y_all)) + 2.0
+    shared_grid = np.linspace(grid_lo, grid_hi, n_bins)
+
+    icm_scores: list[float] = []
+    pi_scores: list[float] = []
+
+    for t_idx in range(n_timesteps):
+        # Define training window
+        train_start = max(0, t_idx - train_window)
+        train_end = max(train_start + 5, t_idx)  # at least 5 samples
+
+        X_train_w = X_all[train_start:train_end]
+        y_train_w = y_all[train_start:train_end]
+
+        if len(X_train_w) < 3:
+            # Not enough data; use fallback predictions
+            for name in model_names:
+                predictions_dict_t[name][t_idx] = float(np.mean(y_all[:max(1, t_idx)]))
+            icm_scores.append(0.5)
+            pi_scores.append(0.0)
+            continue
+
+        X_test_point = X_all[t_idx:t_idx+1]
+
+        step_preds: dict[str, NDArray] = {}
+        for name, builder_fn in model_families:
+            model = builder_fn(seed + t_idx)
+            try:
+                model.fit(X_train_w, y_train_w)
+                pred_val = float(model.predict(X_test_point)[0])
+            except Exception:
+                pred_val = float(np.mean(y_train_w))
+            predictions_dict_t[name][t_idx] = pred_val
+
+            # Convert to probability over shared grid for Hellinger
+            probs = np.exp(-0.5 * (shared_grid - pred_val) ** 2)
+            probs /= probs.sum()
+            step_preds[name] = probs
+
+        result = compute_icm_from_predictions(
+            step_preds, config=config, distance_fn="hellinger",
+        )
+        icm_scores.append(result.icm_score)
+        pi_scores.append(result.components.Pi)
+
+    return predictions_dict_t, icm_scores, pi_scores
+
+
+def run_single_trial_real(
+    n_timesteps: int,
+    change_at: int,
+    shift_magnitude: float,
+    window_size: int,
+    ew_config: EarlyWarningConfig,
+    seed: int,
+    max_lead_time: int = 50,
+    cooldown: int = 50,
+) -> dict:
+    """Run one trial using real model families and return metrics."""
+
+    preds_t, icm_scores, pi_scores = build_timeseries_predictions_real(
+        n_timesteps=n_timesteps,
+        change_at=change_at,
+        shift_magnitude=shift_magnitude,
+        seed=seed,
+    )
+
+    icm_arr = np.array(icm_scores)
+    pi_arr = np.array(pi_scores)
+
+    delta_icm = compute_delta_icm(icm_arr, window_size)
+    var_preds = compute_prediction_variance(preds_t)
+    pi_trend = compute_rolling_icm(pi_arr, window_size)
+    z_signal = compute_z_signal(delta_icm, var_preds, pi_trend, ew_config)
+
+    calibration_end = max(change_at // 2, window_size + 10)
+    thr = calibrate_thresholds(icm_arr, var_preds, z_signal, calibration_end)
+
+    # Detectors
+    cusum_det = cusum_debounced(
+        z_signal, thr["cusum_threshold"], thr["cusum_drift"], cooldown,
+    )
+    ph_det = page_hinkley_debounced(
+        z_signal, thr["ph_threshold"], thr["ph_alpha"], cooldown,
+    )
+    naive_det = naive_icm_threshold_detector(icm_arr, thr["naive_icm"])
+    var_det = variance_only_detector(var_preds, thr["variance"])
+
+    true_changes = [change_at]
+
+    results: dict[str, dict] = {}
+    for name, detected in [
+        ("cusum", cusum_det),
+        ("page_hinkley", ph_det),
+        ("naive_icm", naive_det),
+        ("variance_only", var_det),
+    ]:
+        ev = evaluate_detections(
+            detected, true_changes, n_timesteps, max_lead_time,
+            grace_period=cooldown,
+        )
+        results[name] = ev
+
+    for name, detected in [("cusum", cusum_det), ("page_hinkley", ph_det)]:
+        ev_fw = evaluate_early_warning(detected, true_changes, max_lead_time)
+        results[name]["fw_tpr"] = ev_fw["true_positive_rate"]
+        results[name]["fw_fpr"] = ev_fw["false_positive_rate"]
+
+    stable_start = window_size + 5
+    stable_end = change_at - 20
+    if stable_end > stable_start + 10:
+        stable_periods = [(stable_start, stable_end)]
+        for det_name, det_fn in [
+            (
+                "cusum",
+                lambda sig: cusum_debounced(
+                    sig, thr["cusum_threshold"], thr["cusum_drift"], cooldown,
+                ),
+            ),
+            (
+                "page_hinkley",
+                lambda sig: page_hinkley_debounced(
+                    sig, thr["ph_threshold"], thr["ph_alpha"], cooldown,
+                ),
+            ),
+        ]:
+            placebo = placebo_test(z_signal, stable_periods, det_fn)
+            results[det_name]["placebo_far"] = placebo["false_alarm_rate"]
+    else:
+        for det_name in ["cusum", "page_hinkley"]:
+            results[det_name]["placebo_far"] = float("nan")
+
+    results["_diagnostics"] = {
+        "icm_pre_mean": float(np.mean(icm_arr[:change_at])),
+        "icm_post_mean": float(np.mean(icm_arr[change_at:])),
+        "icm_drop": float(np.mean(icm_arr[:change_at]) - np.mean(icm_arr[change_at:])),
+        "var_pre_mean": float(np.mean(var_preds[:change_at])),
+        "var_post_mean": float(np.mean(var_preds[change_at:])),
+        "z_pre_mean": float(np.mean(z_signal[:change_at])),
+        "z_post_mean": float(np.mean(z_signal[change_at:])),
+        "z_pre_std": float(np.std(z_signal[:change_at])),
+        "z_post_std": float(np.std(z_signal[change_at:])),
+        "thresholds": thr,
+    }
+
+    return results
+
+
+def run_q3_real_models(
+    n_reps: int = 5,
+    seed: int = 42,
+) -> dict:
+    """Run Q3 early-warning experiment using real model families.
+
+    This supplements the main() experiment by using genuinely diverse model
+    families (DT, LR, KNN, RF, GBM) trained on each time window instead of
+    noise-perturbed copies of a single prediction.
+
+    Parameters
+    ----------
+    n_reps : int
+        Number of repetitions per configuration.
+    seed : int
+        Base random seed.
+
+    Returns
+    -------
+    dict with magnitude_results and window_results using real models.
+    """
+    print("=" * 80)
+    print("EXPERIMENT Q3 (REAL MODELS): Validate dC/dt as Early Warning Signal")
+    print("  Using genuinely diverse model families per time window")
+    print("=" * 80)
+
+    start_time = time.time()
+
+    n_timesteps = 300
+    change_at = 150
+    max_lead_time = 50
+    cooldown = 50
+
+    ew_config_default = EarlyWarningConfig()
+
+    # Magnitude sweep
+    shifts = [1.0, 2.0, 4.0]
+    shift_labels = {1.0: "small(1.0)", 2.0: "medium(2.0)", 4.0: "large(4.0)"}
+    mag_results: dict[str, dict] = {}
+
+    print("\n[1/2] Running magnitude sweep with real models ...")
+    for s in shifts:
+        trials = []
+        for rep in range(n_reps):
+            rep_seed = seed + rep * 137
+            res = run_single_trial_real(
+                n_timesteps, change_at, s,
+                ew_config_default.window_size, ew_config_default, rep_seed,
+                max_lead_time, cooldown,
+            )
+            trials.append(res)
+        mag_results[shift_labels[s]] = aggregate_results(trials)
+        print(f"    shift={s} done.")
+
+    print_main_table(
+        mag_results,
+        "EXPERIMENT (REAL MODELS): Effect of Change Magnitude",
+        "Magnitude",
+    )
+    print_diagnostics(mag_results)
+
+    # Window sweep
+    print("\n[2/2] Running window-size sweep with real models ...")
+    window_sizes = [20, 50, 100]
+    win_results: dict[str, dict] = {}
+
+    for ws in window_sizes:
+        cfg = EarlyWarningConfig(
+            window_size=ws,
+            a1=ew_config_default.a1,
+            a2=ew_config_default.a2,
+            a3=ew_config_default.a3,
+            cusum_threshold=ew_config_default.cusum_threshold,
+            cusum_drift=ew_config_default.cusum_drift,
+        )
+        trials = []
+        for rep in range(n_reps):
+            rep_seed = seed + rep * 137
+            res = run_single_trial_real(
+                n_timesteps, change_at, 2.0,
+                ws, cfg, rep_seed, max_lead_time, cooldown,
+            )
+            trials.append(res)
+        win_results[f"w={ws:03d}"] = aggregate_results(trials)
+        print(f"    window_size={ws} done.")
+
+    print_main_table(
+        win_results,
+        "EXPERIMENT (REAL MODELS): Effect of Window Size (shift=2.0)",
+        "Window",
+    )
+
+    elapsed = time.time() - start_time
+    print(f"\nTotal real-model experiment time: {elapsed:.1f}s")
+
+    return {
+        "magnitude_results": mag_results,
+        "window_results": win_results,
+        "n_reps": n_reps,
+        "elapsed": elapsed,
+    }
+
+
+def main(use_real_models: bool = True):
+    """Run Q3 experiment.
+
+    Parameters
+    ----------
+    use_real_models : bool
+        When True (default), also run the real-model variant after the
+        legacy experiment.  When False, run only the legacy experiment.
+    """
+    # Always run legacy experiment (it legitimately needs time-varying data)
+    print("=" * 80)
+    print("EXPERIMENT Q3: Validate dC/dt as Early Warning Signal")
+    print("  Detectors : CUSUM, Page-Hinkley (with cooldown debounce)")
+    print("  Baselines : Naive ICM threshold, Variance-only threshold")
+    print("  Framework : OS Multi-Science ICM v1.1")
+    print("  Signal    : Z_t = a1*(-dC/dt) + a2*Var(y_hat) + a3*Pi_trend")
+    print("=" * 80)
+
+    start_time = time.time()
+
+    n_timesteps = 500
+    change_at = 250
+    n_reps = 10
+    max_lead_time = 50
+    cooldown = 50
+    base_seed = 42
+
+    ew_config_default = EarlyWarningConfig()
+
+    # ================================================================
+    # Experiment 1: Vary change magnitude
+    # ================================================================
+    print("\n[1/3] Running magnitude sweep (shift = 0.5, 1.5, 3.0) ...")
+    shifts = [0.5, 1.5, 3.0]
+    shift_labels = {0.5: "small(0.5)", 1.5: "medium(1.5)", 3.0: "large(3.0)"}
+    mag_results: dict[str, dict] = {}
+
+    for s in shifts:
+        trials = []
+        for rep in range(n_reps):
+            seed = base_seed + rep * 137
+            res = run_single_trial(
+                n_timesteps, change_at, s,
+                ew_config_default.window_size, ew_config_default, seed,
+                max_lead_time, cooldown,
+            )
+            trials.append(res)
+        mag_results[shift_labels[s]] = aggregate_results(trials)
+        print(f"    shift={s} done.")
+
+    print_main_table(
+        mag_results,
+        "EXPERIMENT 1: Effect of Change Magnitude",
+        "Magnitude",
+    )
+    print_diagnostics(mag_results)
+    print_placebo(mag_results)
+
+    # ================================================================
+    # Experiment 2: Vary window size
+    # ================================================================
+    print("\n[2/3] Running window-size sweep (w = 20, 50, 100, 200) ...")
+    window_sizes = [20, 50, 100, 200]
+    win_results: dict[str, dict] = {}
+
+    for ws in window_sizes:
+        cfg = EarlyWarningConfig(
+            window_size=ws,
+            a1=ew_config_default.a1,
+            a2=ew_config_default.a2,
+            a3=ew_config_default.a3,
+            cusum_threshold=ew_config_default.cusum_threshold,
+            cusum_drift=ew_config_default.cusum_drift,
+        )
+        trials = []
+        for rep in range(n_reps):
+            seed = base_seed + rep * 137
+            res = run_single_trial(
+                n_timesteps, change_at, 1.5,
+                ws, cfg, seed, max_lead_time, cooldown,
+            )
+            trials.append(res)
+        win_results[f"w={ws:03d}"] = aggregate_results(trials)
+        print(f"    window_size={ws} done.")
+
+    print_main_table(
+        win_results,
+        "EXPERIMENT 2: Effect of Window Size (shift=1.5)",
+        "Window",
+    )
+    print_diagnostics(win_results)
+    print_placebo(win_results)
+
+    # ================================================================
+    # Experiment 3: Full cross-product
+    # ================================================================
+    print("\n[3/3] Running cross-product sweep ...")
+    cross: dict[str, dict] = {}
+
+    for s in shifts:
+        for ws in window_sizes:
+            cfg = EarlyWarningConfig(
+                window_size=ws,
+                a1=ew_config_default.a1,
+                a2=ew_config_default.a2,
+                a3=ew_config_default.a3,
+                cusum_threshold=ew_config_default.cusum_threshold,
+                cusum_drift=ew_config_default.cusum_drift,
+            )
+            trials = []
+            for rep in range(n_reps):
+                seed = base_seed + rep * 137
+                res = run_single_trial(
+                    n_timesteps, change_at, s,
+                    ws, cfg, seed, max_lead_time, cooldown,
+                )
+                trials.append(res)
+            cross[f"s={s},w={ws:03d}"] = aggregate_results(trials)
+
+    print_cross_product(cross, "cusum",
+        "CROSS-PRODUCT: CUSUM (magnitude x window)")
+    print_cross_product(cross, "page_hinkley",
+        "CROSS-PRODUCT: Page-Hinkley (magnitude x window)")
+
+    # ================================================================
+    # Summary
+    # ================================================================
+    elapsed = time.time() - start_time
+    print()
+    print("=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+
+    for det_label, det_key in [("CUSUM", "cusum"), ("Page-Hinkley", "page_hinkley")]:
+        best_key = max(
+            cross.keys(),
+            key=lambda k: cross[k][det_key]["f1_mean"],
+        )
+        b = cross[best_key][det_key]
+        print(
+            f"Best {det_label} (by F1): {best_key}  "
+            f"TPR={b['tpr_mean']:.3f}  FPR={b['fpr_mean']:.5f}  "
+            f"Prec={b['precision_mean']:.3f}  F1={b['f1_mean']:.3f}  "
+            f"Lead={b['mean_lead_time_mean']:.1f}"
+        )
+
+    ref_key = "medium(1.5)"
+    if ref_key in mag_results:
+        ref = mag_results[ref_key]
+        print()
+        print("Detector comparison at medium shift (1.5), window=100:")
+        print(f"  {'Detector':<18s} {'TPR':>6s} {'FPR':>8s} {'Prec':>6s} {'F1':>6s} {'Lead':>6s} {'N':>4s}")
+        print(f"  {'-'*56}")
+        for det in ["cusum", "page_hinkley", "naive_icm", "variance_only"]:
+            d = ref[det]
+            print(
+                f"  {det:<18s} {d['tpr_mean']:6.3f} {d['fpr_mean']:8.5f} "
+                f"{d['precision_mean']:6.3f} {d['f1_mean']:6.3f} "
+                f"{d['mean_lead_time_mean']:6.1f} {d['n_detections_mean']:4.1f}"
+            )
+
+    print()
+    n_total = (len(shifts) + len(window_sizes) + len(shifts)*len(window_sizes)) * n_reps
+    print(f"Total experiment time: {elapsed:.1f}s")
+    print(f"Configurations tested: {len(cross)}")
+    print(f"Total trials: {n_total}")
+    print()
+
+    legacy_results = {
+        "magnitude_results": mag_results,
+        "window_results": win_results,
+        "cross_results": cross,
+        "n_reps": n_reps,
+        "elapsed": elapsed,
+    }
+
+    # ================================================================
+    # Run real-model supplement if requested
+    # ================================================================
+    if use_real_models:
+        real_results = run_q3_real_models(n_reps=5, seed=42)
+        legacy_results["real_model_results"] = real_results
+
+    return legacy_results
+
+
 if __name__ == "__main__":
     main()

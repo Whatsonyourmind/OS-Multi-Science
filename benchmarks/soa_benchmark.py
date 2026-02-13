@@ -118,16 +118,57 @@ def _icm_weighted_ensemble_regression(
     return weighted
 
 
+def _compute_training_residuals_classification(
+    preds_train: dict[str, np.ndarray],
+    y_train: np.ndarray,
+) -> np.ndarray:
+    """Compute residual matrix from training predictions for Pi computation.
+
+    Returns a (K, n*C) residual matrix where K is the number of models,
+    n is the number of training samples, and C is the number of classes.
+    This avoids using test labels for the dependency penalty.
+    """
+    model_names = sorted(preds_train.keys())
+    y_tr = np.asarray(y_train, dtype=int)
+    n = len(y_tr)
+
+    # Get n_classes from the first prediction
+    first_pred = np.asarray(preds_train[model_names[0]], dtype=np.float64)
+    if first_pred.ndim == 2 and first_pred.shape[1] > 1:
+        n_classes = first_pred.shape[1]
+        one_hot = np.zeros((n, n_classes), dtype=np.float64)
+        one_hot[np.arange(n), np.clip(y_tr, 0, n_classes - 1)] = 1.0
+        rows = []
+        for m in model_names:
+            pred = np.asarray(preds_train[m], dtype=np.float64)[:n]
+            rows.append((pred - one_hot).ravel())
+        return np.stack(rows)
+    else:
+        # 1-D predictions (regression-style)
+        y_float = np.asarray(y_train, dtype=np.float64)
+        rows = []
+        for m in model_names:
+            pred = np.asarray(preds_train[m], dtype=np.float64).ravel()[:n]
+            rows.append(pred - y_float[:len(pred)])
+        return np.stack(rows)
+
+
 def _compute_per_model_icm_classification(
     predictions: dict[str, np.ndarray],
-    y_true: np.ndarray,
     config: ICMConfig,
+    *,
+    preds_train: dict[str, np.ndarray] | None = None,
+    y_train: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute an ICM-like quality score for each model via leave-one-out contribution.
 
     For each model, compute ICM with vs. without it. The difference (contribution)
     serves as the per-model score. Models that improve ensemble agreement get
     higher scores.
+
+    ICM is computed WITHOUT test labels to avoid circularity.  Pi is either
+    set to 0 (unsupervised) or computed from training residuals when
+    ``preds_train`` and ``y_train`` are provided.
     """
     model_names = sorted(predictions.keys())
     if len(model_names) < 3:
@@ -138,16 +179,28 @@ def _compute_per_model_icm_classification(
             scores[m] = float(np.mean(np.max(pred, axis=1)))
         return scores
 
-    # Full ensemble ICM (per-sample, then average)
+    # Compute training residuals for Pi if training data is available
+    train_residuals = None
+    if preds_train is not None and y_train is not None:
+        train_residuals = _compute_training_residuals_classification(
+            preds_train, y_train,
+        )
+
+    # Full ensemble ICM (per-sample, then average) -- no y_true, Pi from training
     full_icm = compute_icm_from_predictions(
-        predictions, config=config, y_true=y_true,
+        predictions, config=config, y_true=None, residuals=train_residuals,
     ).icm_score
 
     scores = {}
     for m in model_names:
         subset = {k: v for k, v in predictions.items() if k != m}
+        # Compute subset residuals from training data if available
+        sub_residuals = None
+        if train_residuals is not None:
+            sub_indices = [i for i, name in enumerate(model_names) if name != m]
+            sub_residuals = train_residuals[sub_indices]
         sub_icm = compute_icm_from_predictions(
-            subset, config=config, y_true=y_true,
+            subset, config=config, y_true=None, residuals=sub_residuals,
         ).icm_score
         # Contribution = how much ICM drops when we remove this model
         contribution = full_icm - sub_icm
@@ -159,13 +212,19 @@ def _compute_per_model_icm_classification(
 
 def _compute_per_model_icm_regression(
     predictions: dict[str, np.ndarray],
-    y_true: np.ndarray,
     config: ICMConfig,
+    *,
+    preds_train: dict[str, np.ndarray] | None = None,
+    y_train: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute per-model ICM contribution scores for regression.
 
     Uses wasserstein distance (which handles real-valued predictions)
     instead of hellinger (which requires non-negative distributions).
+
+    ICM is computed WITHOUT test labels to avoid circularity.  Pi is either
+    set to 0 (unsupervised) or computed from training residuals when
+    ``preds_train`` and ``y_train`` are provided.
     """
     model_names = sorted(predictions.keys())
     # For regression, use mean column as point prediction for ICM
@@ -175,22 +234,47 @@ def _compute_per_model_icm_regression(
         point_preds[m] = arr[:, 0]  # mean column
 
     if len(model_names) < 3:
+        # With < 3 models, use prediction spread as proxy (no y_true)
         scores = {}
+        ensemble_mean = np.mean(
+            [point_preds[m] for m in model_names], axis=0,
+        )
         for m in model_names:
-            residuals = np.abs(point_preds[m] - y_true)
-            scores[m] = float(1.0 / (1.0 + np.mean(residuals)))
+            # How close is this model to the ensemble mean (unsupervised)
+            deviation = np.mean(np.abs(point_preds[m] - ensemble_mean))
+            scores[m] = float(1.0 / (1.0 + deviation))
         return scores
 
+    # Compute training residuals for Pi if training data is available
+    train_residuals = None
+    if preds_train is not None and y_train is not None:
+        train_point_preds = {}
+        for m in model_names:
+            if m in preds_train:
+                arr = np.asarray(preds_train[m], dtype=np.float64)
+                train_point_preds[m] = arr[:, 0]
+        if len(train_point_preds) >= 2:
+            y_tr = np.asarray(y_train, dtype=np.float64)
+            rows = []
+            for m in model_names:
+                if m in train_point_preds:
+                    rows.append(train_point_preds[m] - y_tr)
+            train_residuals = np.stack(rows)
+
     full_icm = compute_icm_from_predictions(
-        point_preds, config=config, y_true=y_true,
+        point_preds, config=config, y_true=None, residuals=train_residuals,
         distance_fn="wasserstein",
     ).icm_score
 
     scores = {}
     for m in model_names:
         subset = {k: v for k, v in point_preds.items() if k != m}
+        sub_residuals = None
+        if train_residuals is not None:
+            sub_indices = [i for i, name in enumerate(model_names) if name != m]
+            sub_residuals = train_residuals[sub_indices]
         sub_icm = compute_icm_from_predictions(
-            subset, config=config, y_true=y_true,
+            subset, config=config, y_true=None, residuals=sub_residuals,
             distance_fn="wasserstein",
         ).icm_score
         contribution = full_icm - sub_icm
@@ -201,7 +285,6 @@ def _compute_per_model_icm_regression(
 
 def _compute_per_sample_icm_classification(
     predictions: dict[str, np.ndarray],
-    y_true: np.ndarray,
     config: ICMConfig,
 ) -> np.ndarray:
     """Compute per-sample ICM scores for classification.
@@ -210,6 +293,14 @@ def _compute_per_sample_icm_classification(
     pairwise Hellinger distance among models' predicted probability
     distributions, then aggregate via the ICM formula.
 
+    ICM is computed WITHOUT test labels to avoid circularity.  Only
+    unsupervised components are used:
+    - A (agreement): pairwise Hellinger distance between model predictions
+    - D (direction): direction agreement across models
+    - U (uncertainty overlap): overlap of per-model prediction intervals
+    - C (invariance): set to 1.0 (no perturbation)
+    - Pi (dependency): set to 0.0 (no test labels available)
+
     Returns
     -------
     np.ndarray of shape (n_samples,) with ICM scores in [0, 1].
@@ -217,22 +308,11 @@ def _compute_per_sample_icm_classification(
     from scipy.special import expit as _expit
 
     model_names = sorted(predictions.keys())
-    n_samples = len(y_true)
-    K = len(model_names)
     pred_arrays = [np.asarray(predictions[m], dtype=np.float64) for m in model_names]
-    n_classes = pred_arrays[0].shape[1]
-    y_int = np.asarray(y_true, dtype=int)
+    n_samples = pred_arrays[0].shape[0]
+    K = len(model_names)
 
     icm_scores = np.empty(n_samples, dtype=np.float64)
-
-    # Precompute one-hot for residual correlation
-    one_hot = np.zeros((n_samples, n_classes), dtype=np.float64)
-    one_hot[np.arange(n_samples), np.clip(y_int, 0, n_classes - 1)] = 1.0
-
-    # Precompute residuals per model: (K, n_samples, n_classes)
-    resid_per_model = np.stack(
-        [pred_arrays[k] - one_hot for k in range(K)], axis=0,
-    )  # (K, n_samples, n_classes)
 
     for i in range(n_samples):
         # A: agreement via Hellinger per-sample
@@ -264,20 +344,8 @@ def _compute_per_sample_icm_classification(
         # C: invariance -- no perturbation, stable
         C_val = 1.0
 
-        # Pi: dependency from residual correlation at this sample
-        # Use a lightweight approach: mean absolute cross-residual product
-        resid_i = resid_per_model[:, i, :]  # (K, n_classes)
-        resid_flat = resid_i.reshape(K, -1)
-        if K >= 2 and resid_flat.shape[1] >= 2:
-            # Mean absolute correlation of residual vectors
-            norms = np.linalg.norm(resid_flat, axis=1, keepdims=True)
-            norms = np.where(norms < 1e-12, 1.0, norms)
-            normed = resid_flat / norms
-            corr_matrix = normed @ normed.T
-            mask = ~np.eye(K, dtype=bool)
-            Pi = float(np.clip(np.mean(np.abs(corr_matrix[mask])), 0.0, 1.0))
-        else:
-            Pi = 0.0
+        # Pi: set to 0 -- no test labels used (avoids circularity)
+        Pi = 0.0
 
         # ICM aggregation
         z_raw = (
@@ -394,9 +462,10 @@ def experiment_prediction_quality(
             preds_train = collect_predictions_classification(models, X_train)
             preds_test = collect_predictions_classification(models, X_test)
 
-        # ICM-weighted ensemble
+        # ICM-weighted ensemble (no test labels for ICM -- uses training residuals)
         per_model_icm = _compute_per_model_icm_classification(
-            preds_test, y_test, config,
+            preds_test, config,
+            preds_train=preds_train, y_train=y_train,
         )
         icm_weighted = _icm_weighted_ensemble_classification(preds_test, per_model_icm)
         icm_scores = _compute_standard_scores(icm_weighted, y_test)
@@ -461,14 +530,17 @@ def experiment_prediction_quality(
         # Regression
         if _preds_test is not None:
             preds_test = _preds_test
+            preds_train = _preds_train
         else:
             models = build_regression_zoo(seed=seed)
             train_zoo(models, X_train, y_train)
             preds_test = collect_predictions_regression(models, X_test)
+            preds_train = collect_predictions_regression(models, X_train)
 
-        # ICM-weighted ensemble
+        # ICM-weighted ensemble (no test labels -- uses training residuals)
         per_model_icm = _compute_per_model_icm_regression(
-            preds_test, y_test, config,
+            preds_test, config,
+            preds_train=preds_train, y_train=y_train,
         )
         icm_weighted = _icm_weighted_ensemble_regression(preds_test, per_model_icm)
         rmse_icm = float(np.sqrt(np.mean((icm_weighted - y_test) ** 2)))
@@ -545,9 +617,9 @@ def experiment_uncertainty_quantification(
 
     y_test_int = np.asarray(y_test, dtype=int)
 
-    # ICM-based prediction sets
+    # ICM-based prediction sets (no test labels for ICM computation)
     per_sample_icm = _compute_per_sample_icm_classification(
-        preds_test, y_test_int, config,
+        preds_test, config,
     )
     icm_sets = _icm_prediction_sets_classification(
         preds_test, per_sample_icm,
@@ -663,9 +735,9 @@ def experiment_error_detection(
         preds_test = collect_predictions_classification(models, X_test)
     y_test_int = np.asarray(y_test, dtype=int)
 
-    # Compute per-sample signals
+    # Compute per-sample signals (ICM computed WITHOUT test labels)
     per_sample_icm = _compute_per_sample_icm_classification(
-        preds_test, y_test_int, config,
+        preds_test, config,
     )
     per_sample_error = _compute_per_sample_error_classification(preds_test, y_test_int)
     ens_entropy = _ensemble_entropy(preds_test)
@@ -777,9 +849,9 @@ def experiment_diversity_assessment(
         preds_test = collect_predictions_classification(models, X_test)
     y_test_int = np.asarray(y_test, dtype=int)
 
-    # ICM components
+    # ICM components (no test labels for ICM -- avoids circularity)
     icm_result = compute_icm_from_predictions(
-        preds_test, config=config, y_true=y_test_int,
+        preds_test, config=config, y_true=None,
     )
     comps = icm_result.components
 
@@ -870,7 +942,7 @@ def experiment_score_range(
 
     for name, cfg in configs.items():
         per_sample = _compute_per_sample_icm_classification(
-            preds_test, y_test_int, cfg,
+            preds_test, cfg,
         )
         all_scores[name] = per_sample
 
@@ -1038,13 +1110,14 @@ def run_soa_benchmark(seed: int = 42, verbose: bool = True) -> dict:
         # Train regression models once
         reg_models = build_regression_zoo(seed=seed)
         train_zoo(reg_models, X_train, y_train)
+        reg_preds_train = collect_predictions_regression(reg_models, X_train)
         reg_preds_test = collect_predictions_regression(reg_models, X_test)
 
         # Experiment 1 (regression)
         exp1 = experiment_prediction_quality(
             ds_name, X_train, X_test, y_train, y_test,
             task="regression", seed=seed, config=config,
-            _preds_test=reg_preds_test,
+            _preds_train=reg_preds_train, _preds_test=reg_preds_test,
         )
         if verbose:
             print("  Exp 1 (Prediction Quality - Regression):")

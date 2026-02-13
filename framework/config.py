@@ -49,10 +49,16 @@ class ICMConfig:
         """Validate configuration parameters."""
         for name in ("w_A", "w_D", "w_U", "w_C", "lam"):
             val = getattr(self, name)
-            if not 0.0 <= val <= 1.0:
-                raise ValueError(f"{name} must be in [0, 1], got {val}")
+            if not 0.0 < val <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1], got {val}")
+        for name in ("gamma_rho", "gamma_J", "gamma_grad"):
+            val = getattr(self, name)
+            if val < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {val}")
         if self.logistic_scale <= 0:
             raise ValueError(f"logistic_scale must be positive, got {self.logistic_scale}")
+        if self.beta_shape_a <= 0 or self.beta_shape_b <= 0:
+            raise ValueError(f"Beta shape parameters must be positive, got a={self.beta_shape_a}, b={self.beta_shape_b}")
         if self.aggregation not in ("logistic", "geometric", "calibrated", "adaptive"):
             raise ValueError(f"Unknown aggregation mode: {self.aggregation!r}")
 

@@ -246,11 +246,11 @@ class TestComputeDirection:
         assert compute_direction(signs) == pytest.approx(1.0, abs=1e-6)
 
     def test_uniform_signs(self):
-        # Equal split with K=4: H = log(2), H_max = log(K) = log(4)
-        # D = 1 - log(2)/log(4) = 0.5
+        # Equal split with K=4, 2 unique signs: H = log(2), H_max = log(|C|) = log(2)
+        # D = 1 - log(2)/log(2) = 0.0
         signs = np.array([1, -1, 1, -1])
         D = compute_direction(signs)
-        expected = 1.0 - np.log(2) / np.log(4)
+        expected = 0.0  # Maximum entropy over 2 categories
         assert D == pytest.approx(expected, abs=1e-6)
 
     def test_bounded_0_1(self):

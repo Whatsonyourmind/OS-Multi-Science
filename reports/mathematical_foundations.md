@@ -164,7 +164,7 @@ More precisely, the Lipschitz constant is:
 
 $$L_{\text{ICM}} = \frac{1}{4}\sqrt{w_A^2 + w_D^2 + w_U^2 + w_C^2 + \lambda^2}$$
 
-With default parameters: $L_{\text{ICM}} = \frac{1}{4}\sqrt{0.35^2 + 0.15^2 + 0.25^2 + 0.10^2 + 0.15^2} = \frac{1}{4}\sqrt{0.2300} \approx 0.1199$.
+With default parameters: $L_{\text{ICM}} = \frac{1}{4}\sqrt{0.35^2 + 0.15^2 + 0.25^2 + 0.10^2 + 0.15^2} = \frac{1}{4}\sqrt{0.2400} \approx 0.1225$.
 
 **Proof.**
 
@@ -216,7 +216,7 @@ $\square$
 
 ### 2.6 Proposition (Concavity in Positive Components)
 
-**Statement.** For fixed $\Pi$, the ICM score is a *strictly concave* function of $(A, D, U, C)$.
+**Statement.** For fixed $\Pi$, the ICM score is a *strictly concave* function of $(A, D, U, C)$ in the region where $z = w_A A + w_D D + w_U U + w_C C - \lambda\Pi \geq 0$ (i.e., when the weighted agreement exceeds the penalty). In the region $z < 0$, the sigmoid is convex.
 
 **Proof sketch.** The sigmoid $\sigma$ is a concave function on $[0, +\infty)$ (since $\sigma''(z) = \sigma'(z)(1-2\sigma(z)) < 0$ for $z > 0$). Since $z = w_A A + w_D D + w_U U + w_C C - \lambda\Pi$ is affine in $(A, D, U, C)$ for fixed $\Pi$, and $z \geq 0$ when the components are sufficiently large, the composition $\sigma(z)$ is concave in $(A, D, U, C)$ on the region $\{z \geq 0\}$. In general, $\sigma$ is neither globally concave nor convex, but is *log-concave* on all of $\mathbb{R}$ (i.e., $\log \sigma$ is concave).  $\square$
 
@@ -230,13 +230,13 @@ $\square$
 
 **Definition 2 (Distributional Agreement).** Given $K$ model output distributions $\{P_1, \ldots, P_K\}$ and a distance function $d$ (Hellinger, Wasserstein, or MMD):
 
-$$A(\mathcal{F}) = 1 - \frac{\text{median}_{i < j}\, d(P_i, P_j)}{C_A}$$
+$$A(\mathcal{F}) = 1 - \frac{\text{mean}_{i < j}\, d(P_i, P_j)}{C_A}$$
 
 where $C_A > 0$ is a normalization constant, and the result is clipped to $[0, 1]$:
 
-$$A = \text{clip}\!\left(1 - \frac{\text{median}_{i < j}\, d(P_i, P_j)}{C_A},\; 0,\; 1\right)$$
+$$A = \text{clip}\!\left(1 - \frac{\text{mean}_{i < j}\, d(P_i, P_j)}{C_A},\; 0,\; 1\right)$$
 
-**Remark.** The use of the median (rather than the mean) over the $\binom{K}{2}$ pairwise distances provides robustness to outlier models. The normalization constant $C_A$ should be chosen to reflect the maximum expected distance for the given distance function and domain.
+**Remark.** The mean over the $\binom{K}{2}$ pairwise distances captures the average level of agreement across all model pairs. The normalization constant $C_A$ should be chosen to reflect the maximum expected distance for the given distance function and domain.
 
 ---
 

@@ -776,17 +776,202 @@ def run_scenario(
 
 
 # =====================================================================
+# Real-model scenario runner
+# =====================================================================
+
+def run_scenario_real(
+    scenario: str,
+    seed: int,
+) -> dict:
+    """Run one scenario for one seed using REAL model families.
+
+    Uses the genuine model zoo from benchmarks.model_zoo trained on real
+    datasets from benchmarks.datasets.
+
+    Parameters
+    ----------
+    scenario : one of {"classification", "regression"}.
+    seed : random seed.
+
+    Returns
+    -------
+    dict with same keys as run_scenario.
+    """
+    from benchmarks.datasets import load_dataset
+    from benchmarks.model_zoo import (
+        build_classification_zoo,
+        build_regression_zoo,
+        train_zoo,
+        collect_predictions_classification,
+        collect_predictions_regression,
+    )
+
+    rng = np.random.default_rng(seed)
+    icm_config = ICMConfig.wide_range_preset()
+
+    if scenario == "classification":
+        ds_name = "breast_cancer"
+        X_train, X_test, y_train, y_test = load_dataset(ds_name, seed=seed)
+
+        models = build_classification_zoo(seed=seed)
+        K_real = len(models)
+        train_zoo(models, X_train, y_train)
+
+        preds = collect_predictions_classification(models, X_test)
+        n_classes = len(np.unique(y_train))
+
+        # Build all_preds list and reference for greedy selection
+        model_names = list(preds.keys())
+        all_preds = [preds[name] for name in model_names]  # each (n, C)
+
+        # Reference: one-hot truth
+        onehot = np.zeros((len(y_test), n_classes))
+        onehot[np.arange(len(y_test)), y_test] = 1.0
+        reference = onehot
+
+        distance_fn = "hellinger"
+        config = icm_config
+
+        def loss_fn(subset_preds):
+            return compute_ensemble_loss_classification(subset_preds, y_test)
+
+    elif scenario == "regression":
+        ds_name = "diabetes"
+        X_train, X_test, y_train, y_test = load_dataset(ds_name, seed=seed)
+
+        models = build_regression_zoo(seed=seed)
+        K_real = len(models)
+        train_zoo(models, X_train, y_train)
+
+        preds = collect_predictions_regression(models, X_test)
+
+        # For ICM: use mean predictions (col 0)
+        model_names = list(preds.keys())
+        all_preds = [preds[name][:, 0] for name in model_names]  # 1D per model
+
+        reference = y_test
+        distance_fn = "wasserstein"
+        config = ICMConfig.wide_range_preset(C_A_wasserstein=3.0)
+
+        # For loss: use full quantile arrays
+        all_preds_full = [preds[name] for name in model_names]
+
+        def loss_fn(subset_preds_full):
+            return compute_ensemble_loss_regression(subset_preds_full, y_test)
+
+    else:
+        raise ValueError(f"Unknown scenario for real models: {scenario!r}")
+
+    # Greedy selection order
+    order = greedy_select_models(
+        all_preds,
+        reference.ravel() if reference.ndim > 1 else reference,
+    )
+
+    # Generate CRC calibration data from the real model predictions
+    # Use a subsample of test data at varying ensemble sizes for calibration
+    n_test = len(y_test)
+    n_cal = min(N_CRC_CALIBRATION, n_test)
+    cal_rng = np.random.default_rng(seed + 999)
+    cal_indices = cal_rng.choice(n_test, size=n_cal, replace=n_cal > n_test)
+
+    icm_cal = np.empty(n_cal)
+    loss_cal = np.empty(n_cal)
+    for ci, idx in enumerate(cal_indices):
+        # Use a random subset of models for each calibration point
+        k_sub = cal_rng.integers(1, K_real + 1)
+        sub_order = cal_rng.choice(K_real, size=k_sub, replace=False)
+        sub_preds = [all_preds[j] for j in sub_order]
+
+        icm_val = compute_icm_for_subset(
+            [p[idx:idx+1] if p.ndim > 1 else np.array([p[idx]]) for p in sub_preds],
+            distance_fn, config,
+            reference=reference[idx:idx+1].ravel() if reference.ndim > 1 else np.array([reference[idx]]),
+        )
+        icm_cal[ci] = icm_val
+
+        if scenario == "regression":
+            sub_means = [all_preds[j][idx] for j in sub_order]
+        else:
+            sub_means_arr = np.mean([all_preds[j][idx] for j in sub_order], axis=0)
+            pred_class = int(np.argmax(sub_means_arr))
+            loss_cal[ci] = 0.0 if pred_class == y_test[idx] else 1.0
+            continue
+
+        ens_mean = float(np.mean(sub_means))
+        loss_cal[ci] = (ens_mean - y_test[idx]) ** 2
+
+    # Evaluate at each K
+    icm_scores = np.empty(K_real)
+    losses_arr = np.empty(K_real)
+    re_scores = np.empty(K_real)
+
+    for k in range(1, K_real + 1):
+        subset_indices = order[:k]
+        subset_preds = [all_preds[i] for i in subset_indices]
+
+        icm_val = compute_icm_for_subset(
+            subset_preds, distance_fn, config,
+            reference=reference.ravel() if reference.ndim > 1 else reference,
+        )
+        icm_scores[k - 1] = icm_val
+
+        if scenario == "regression":
+            subset_preds_loss = [all_preds_full[i] for i in subset_indices]
+        else:
+            subset_preds_loss = subset_preds
+        loss_val = loss_fn(subset_preds_loss)
+        losses_arr[k - 1] = loss_val
+
+        re_val = compute_re_for_ensemble(icm_cal, loss_cal, icm_val, alpha=0.10)
+        re_scores[k - 1] = re_val
+
+    # Marginal gains
+    delta_icm = np.diff(icm_scores, prepend=0.0)
+    delta_loss = np.diff(losses_arr, prepend=losses_arr[0])
+    delta_re = np.diff(re_scores, prepend=re_scores[0])
+
+    k_star_icm = identify_k_star(delta_icm)
+    loss_improvements = -delta_loss
+    k_star_loss = identify_k_star(loss_improvements)
+
+    return {
+        "icm_scores": icm_scores,
+        "losses": losses_arr,
+        "re_scores": re_scores,
+        "delta_icm": delta_icm,
+        "delta_loss": delta_loss,
+        "delta_re": delta_re,
+        "k_star_icm": k_star_icm,
+        "k_star_loss": k_star_loss,
+        "order": order,
+    }
+
+
+# =====================================================================
 # Main experiment
 # =====================================================================
 
-def run_experiment() -> tuple[dict, str]:
+def run_experiment(use_real_models: bool = True) -> tuple[dict, str]:
     """Execute the full Q4 parsimonious diversity experiment.
+
+    Parameters
+    ----------
+    use_real_models : bool
+        When True (default), use genuinely diverse model families from
+        the model zoo trained on real datasets. When False, use the
+        legacy synthetic noise-perturbation approach.
 
     Returns
     -------
     (all_results, report_text)
     """
-    scenarios = ["classification", "regression", "cascade"]
+    if use_real_models:
+        scenarios = ["classification", "regression"]
+        k_max_effective = 8  # Real model zoo has 8 models
+    else:
+        scenarios = ["classification", "regression", "cascade"]
+        k_max_effective = K_MAX
     all_results: dict[str, list[dict]] = {s: [] for s in scenarios}
 
     buf = io.StringIO()
@@ -797,12 +982,14 @@ def run_experiment() -> tuple[dict, str]:
 
     tee("=" * 78)
     tee("  EXPERIMENT Q4: Parsimonious Diversity K*")
+    if use_real_models:
+        tee("  (REAL MODEL ZOO + REAL DATASETS)")
     tee("=" * 78)
     tee()
     tee("  HYPOTHESIS: Beyond threshold K*, marginal informational value")
     tee("  of adding more epistemically diverse models decreases.")
     tee()
-    tee(f"  K_max (model pool)     : {K_MAX}")
+    tee(f"  K_max (model pool)     : {k_max_effective}")
     tee(f"  Repetitions (seeds)    : {N_REPETITIONS}")
     tee(f"  Marginal threshold     : {MARGINAL_THRESHOLD*100:.0f}% of max gain")
     tee(f"  Scenarios              : {', '.join(scenarios)}")
@@ -816,7 +1003,10 @@ def run_experiment() -> tuple[dict, str]:
 
         for rep in range(N_REPETITIONS):
             seed = BASE_SEED + rep * 1000
-            result = run_scenario(scenario, seed)
+            if use_real_models:
+                result = run_scenario_real(scenario, seed)
+            else:
+                result = run_scenario(scenario, seed)
             all_results[scenario].append(result)
 
         dt = time.time() - t0
@@ -857,6 +1047,8 @@ def run_experiment() -> tuple[dict, str]:
         k_stars_icm = [r["k_star_icm"] for r in results_list]
         k_stars_loss = [r["k_star_loss"] for r in results_list]
 
+        n_k = len(mean_icm)  # k_max_effective
+
         summary[scenario] = {
             "mean_icm": mean_icm,
             "std_icm": std_icm,
@@ -882,7 +1074,7 @@ def run_experiment() -> tuple[dict, str]:
             f"{'dICM':>8s}  {'dLoss':>8s}")
         tee("  " + "-" * 110)
 
-        for k in range(K_MAX):
+        for k in range(n_k):
             tee(f"  {k+1:3d}  "
                 f"{mean_icm[k]:8.4f} +/- {std_icm[k]:.4f}  "
                 f"{mean_loss[k]:8.4f} +/- {std_loss[k]:.4f}  "
@@ -911,7 +1103,7 @@ def run_experiment() -> tuple[dict, str]:
     hypothesis_holds = True
     for scenario in scenarios:
         s = summary[scenario]
-        k_half = K_MAX // 2
+        k_half = k_max_effective // 2
         within_half = s["median_k_star_icm"] <= k_half
         if not within_half:
             hypothesis_holds = False
@@ -935,8 +1127,9 @@ def run_experiment() -> tuple[dict, str]:
 
     for scenario in scenarios:
         s = summary[scenario]
+        n_k = len(s["mean_icm"])
         total_icm_gain = s["mean_icm"][-1] - s["mean_icm"][0]
-        gain_at_kstar = (s["mean_icm"][min(s["median_k_star_icm"], K_MAX) - 1]
+        gain_at_kstar = (s["mean_icm"][min(s["median_k_star_icm"], n_k) - 1]
                          - s["mean_icm"][0])
 
         if abs(total_icm_gain) > 1e-12:
@@ -946,7 +1139,7 @@ def run_experiment() -> tuple[dict, str]:
 
         total_loss_reduction = s["mean_loss"][0] - s["mean_loss"][-1]
         loss_at_kstar = (s["mean_loss"][0]
-                         - s["mean_loss"][min(s["median_k_star_icm"], K_MAX) - 1])
+                         - s["mean_loss"][min(s["median_k_star_icm"], n_k) - 1])
 
         if abs(total_loss_reduction) > 1e-12:
             loss_frac = loss_at_kstar / total_loss_reduction * 100
@@ -954,7 +1147,7 @@ def run_experiment() -> tuple[dict, str]:
             loss_frac = 100.0
 
         tee(f"  {scenario.upper()}:")
-        tee(f"    Total ICM gain (K=1 to K={K_MAX}): {total_icm_gain:+.4f}")
+        tee(f"    Total ICM gain (K=1 to K={n_k}): {total_icm_gain:+.4f}")
         tee(f"    ICM gain at K*={s['median_k_star_icm']}:          "
             f"{gain_at_kstar:+.4f} ({frac_captured:.0f}% of total)")
         tee(f"    Total loss reduction:           {total_loss_reduction:+.4f}")
@@ -978,7 +1171,8 @@ def run_experiment() -> tuple[dict, str]:
         tee(f"    {'K':>3s}  {'ICM':>8s}  {'ICM/K':>8s}  {'Marginal ICM/K':>14s}")
         tee(f"    {'---':>3s}  {'---':>8s}  {'-----':>8s}  {'-----------':>14s}")
 
-        for k in range(K_MAX):
+        n_k_s = len(s["mean_icm"])
+        for k in range(n_k_s):
             icm_per_k = s["mean_icm"][k] / (k + 1)
             marginal = s["mean_delta_icm"][k] if k > 0 else s["mean_icm"][0]
             tee(f"    {k+1:3d}  {s['mean_icm'][k]:8.4f}  {icm_per_k:8.4f}  "
@@ -1053,7 +1247,7 @@ def write_report(all_results: dict, report_text: str) -> None:
     os.makedirs(report_dir, exist_ok=True)
     report_path = os.path.join(report_dir, "q4_parsimony_results.md")
 
-    scenarios = ["classification", "regression", "cascade"]
+    scenarios = [s for s in ["classification", "regression", "cascade"] if s in all_results]
 
     # Build markdown report
     md = io.StringIO()
@@ -1063,13 +1257,17 @@ def write_report(all_results: dict, report_text: str) -> None:
     md.write("> more epistemically diverse models decreases (diminishing returns\n")
     md.write("> of diversity).\n\n")
 
+    # Determine K_max from results
+    first_scenario = scenarios[0]
+    k_max_used = len(all_results[first_scenario][0]["icm_scores"])
+
     # Determine verdict
     all_within = True
     for scenario in scenarios:
         results_list = all_results[scenario]
         k_stars = [r["k_star_icm"] for r in results_list]
         median_k = int(np.median(k_stars))
-        if median_k > K_MAX // 2:
+        if median_k > k_max_used // 2:
             all_within = False
 
     verdict = "SUPPORTED" if all_within else "PARTIALLY SUPPORTED"
@@ -1077,7 +1275,7 @@ def write_report(all_results: dict, report_text: str) -> None:
 
     if all_within:
         md.write("The diminishing returns of epistemic diversity are confirmed.\n")
-        md.write(f"K* <= K_max/2 = {K_MAX//2} across all scenarios.\n\n")
+        md.write(f"K* <= K_max/2 = {k_max_used//2} across all scenarios.\n\n")
     else:
         md.write("K* <= K_max/2 in most but not all scenarios.\n\n")
 
@@ -1087,7 +1285,7 @@ def write_report(all_results: dict, report_text: str) -> None:
     md.write("## Experimental Design\n\n")
     md.write("| Parameter | Value |\n")
     md.write("|-----------|-------|\n")
-    md.write(f"| K_max (model pool) | {K_MAX} |\n")
+    md.write(f"| K_max (model pool) | {k_max_used} |\n")
     md.write(f"| Repetitions | {N_REPETITIONS} |\n")
     md.write(f"| Marginal threshold | {MARGINAL_THRESHOLD*100:.0f}% of max gain |\n")
     md.write(f"| Selection strategy | Greedy submodular (max det Sigma_residual) |\n")
@@ -1115,7 +1313,7 @@ def write_report(all_results: dict, report_text: str) -> None:
         mean_icm = float(np.mean(k_stars_icm))
         med_loss = int(np.median(k_stars_loss))
         mean_loss = float(np.mean(k_stars_loss))
-        tag = "YES" if med_icm <= K_MAX // 2 else "NO"
+        tag = "YES" if med_icm <= k_max_used // 2 else "NO"
         md.write(f"| {scenario} | {med_icm} | {mean_icm:.1f} | "
                  f"{med_loss} | {mean_loss:.1f} | {tag} |\n")
 
@@ -1142,7 +1340,8 @@ def write_report(all_results: dict, report_text: str) -> None:
         md.write("| K | ICM (mean +/- std) | Loss (mean +/- std) | Re (mean +/- std) | delta ICM |\n")
         md.write("|---|-------------------|--------------------|--------------------|----------|\n")
 
-        for k in range(K_MAX):
+        n_k_r = len(mean_icm)
+        for k in range(n_k_r):
             md.write(f"| {k+1} | {mean_icm[k]:.4f} +/- {std_icm[k]:.4f} | "
                      f"{mean_loss[k]:.4f} +/- {std_loss[k]:.4f} | "
                      f"{mean_re[k]:.4f} +/- {std_re[k]:.4f} | "
@@ -1154,11 +1353,11 @@ def write_report(all_results: dict, report_text: str) -> None:
         total_gain = mean_icm[-1] - mean_icm[0]
         k_stars = [r["k_star_icm"] for r in results_list]
         med_k = int(np.median(k_stars))
-        gain_at_k = mean_icm[min(med_k, K_MAX) - 1] - mean_icm[0]
+        gain_at_k = mean_icm[min(med_k, n_k_r) - 1] - mean_icm[0]
         frac = gain_at_k / total_gain * 100 if abs(total_gain) > 1e-12 else 100.0
 
         md.write(f"### Diminishing Returns\n\n")
-        md.write(f"- Total ICM gain (K=1 to K={K_MAX}): {total_gain:+.4f}\n")
+        md.write(f"- Total ICM gain (K=1 to K={n_k_r}): {total_gain:+.4f}\n")
         md.write(f"- ICM gain at K*={med_k}: {gain_at_k:+.4f} ({frac:.0f}% of total)\n")
         md.write(f"- K* (median across seeds): {med_k}\n\n")
 
@@ -1179,7 +1378,7 @@ def write_report(all_results: dict, report_text: str) -> None:
 
     md.write("## Conclusion\n\n")
     md.write(f"The parsimonious diversity hypothesis is **{verdict}**.\n")
-    md.write(f"A compact kit of K* diverse methods (typically <= {K_MAX//2}) achieves\n")
+    md.write(f"A compact kit of K* diverse methods (typically <= {k_max_used//2}) achieves\n")
     md.write("the bulk of the benefit in ICM convergence, loss reduction, and\n")
     md.write("epistemic risk control. Beyond K*, additional models contribute\n")
     md.write("diminishing returns due to shared epistemic structure.\n")
@@ -1194,5 +1393,5 @@ def write_report(all_results: dict, report_text: str) -> None:
 
 # =====================================================================
 if __name__ == "__main__":
-    results, text = run_experiment()
+    results, text = run_experiment()  # use_real_models=True by default
     write_report(results, text)

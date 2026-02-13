@@ -26,6 +26,11 @@ DESIGN:
     - Isotonic regression (decreasing) R^2
     - Count of monotonicity violations along sorted ICM
 
+  When ``use_real_models=True`` (default), the experiment uses genuinely
+  diverse model families from ``benchmarks.model_zoo`` trained on real
+  datasets from ``benchmarks.datasets`` instead of noise-perturbed copies
+  of a single prediction.
+
 Run:
     python experiments/q1_monotonicity.py
 
@@ -327,15 +332,341 @@ def verify_monotonicity(icm_scores: np.ndarray, losses: np.ndarray):
 
 
 # =====================================================================
+# Real-model approach: use genuine model families from model_zoo
+# =====================================================================
+
+def _run_real_models_experiment(
+    n_repetitions: int = 5,
+    n_quantile_bins: int = 10,
+    seed: int = 42,
+) -> tuple[dict, dict, bool]:
+    """Run Q1 monotonicity experiment using real model families on real datasets.
+
+    For each dataset:
+      1. Load real dataset from benchmarks.datasets
+      2. Build real model zoo from benchmarks.model_zoo
+      3. Train all models, collect predictions
+      4. Compute per-sample ICM scores using compute_icm_from_predictions
+         with ICMConfig.wide_range_preset()
+      5. Compute per-sample errors (0/1 for classification, squared error for regression)
+      6. Bin samples by ICM score into quantiles
+      7. Show that mean error decreases as ICM increases (Spearman correlation)
+
+    Returns the same structure as the legacy run_experiment.
+    """
+    from benchmarks.datasets import (
+        load_dataset,
+        list_classification_datasets,
+        list_regression_datasets,
+        get_dataset_info,
+    )
+    from benchmarks.model_zoo import (
+        build_classification_zoo,
+        build_regression_zoo,
+        train_zoo,
+        collect_predictions_classification,
+        collect_predictions_regression,
+    )
+
+    icm_config = ICMConfig.wide_range_preset()
+
+    # Select representative datasets
+    classification_datasets = list_classification_datasets()[:3]  # iris, breast_cancer, wine
+    regression_datasets = list_regression_datasets()[:2]  # california_housing, diabetes
+
+    all_results: dict[str, list[dict]] = {}
+    scenario_names = []
+
+    print("=" * 78)
+    print("  EXPERIMENT Q1: Monotonicity of E[L|C] in ICM score C")
+    print("  (REAL MODEL ZOO + REAL DATASETS)")
+    print("=" * 78)
+    print()
+
+    t_start = time.time()
+
+    # --- Classification datasets ---
+    for ds_name in classification_datasets:
+        scenario_key = f"classification_{ds_name}"
+        scenario_names.append(scenario_key)
+        all_results[scenario_key] = []
+
+        print(f"  Running scenario: {scenario_key} ...", end="", flush=True)
+        t0 = time.time()
+
+        for rep in range(n_repetitions):
+            rep_seed = seed + rep * 1000
+            X_train, X_test, y_train, y_test = load_dataset(
+                ds_name, seed=rep_seed, test_size=0.3,
+            )
+
+            # Build and train model zoo
+            models = build_classification_zoo(seed=rep_seed)
+            train_zoo(models, X_train, y_train)
+
+            # Collect predictions on test set
+            preds_dict = collect_predictions_classification(models, X_test)
+
+            n_test = len(y_test)
+            n_classes = len(np.unique(y_train))
+
+            # Compute per-sample ICM scores and losses
+            icm_scores = np.empty(n_test)
+            losses = np.empty(n_test)
+
+            for i in range(n_test):
+                sample_preds = {
+                    name: preds_dict[name][i] for name in preds_dict
+                }
+                result = compute_icm_from_predictions(
+                    sample_preds, config=icm_config, distance_fn="hellinger",
+                )
+                icm_scores[i] = result.icm_score
+
+                # Loss: 0/1 error from ensemble prediction
+                ensemble_probs = np.mean(
+                    [preds_dict[name][i] for name in preds_dict], axis=0,
+                )
+                predicted_class = int(np.argmax(ensemble_probs))
+                losses[i] = 0.0 if predicted_class == y_test[i] else 1.0
+
+            diagnostics = verify_monotonicity(icm_scores, losses)
+            diagnostics["rep"] = rep
+            diagnostics["icm_range"] = (
+                float(icm_scores.min()), float(icm_scores.max()),
+            )
+            diagnostics["loss_range"] = (
+                float(losses.min()), float(losses.max()),
+            )
+
+            # Binned stats (quantile bins)
+            n_bins = min(n_quantile_bins, n_test // 5)
+            n_bins = max(n_bins, 2)
+            bin_edges = np.percentile(icm_scores, np.linspace(0, 100, n_bins + 1))
+            per_bin_icm = []
+            per_bin_loss = []
+            for b in range(n_bins):
+                lo, hi = bin_edges[b], bin_edges[b + 1]
+                if b < n_bins - 1:
+                    mask = (icm_scores >= lo) & (icm_scores < hi)
+                else:
+                    mask = (icm_scores >= lo) & (icm_scores <= hi)
+                if mask.any():
+                    per_bin_icm.append(float(icm_scores[mask].mean()))
+                    per_bin_loss.append(float(losses[mask].mean()))
+
+            diagnostics["per_noise_icm"] = np.array(per_bin_icm)
+            diagnostics["per_noise_loss"] = np.array(per_bin_loss)
+            all_results[scenario_key].append(diagnostics)
+
+        dt = time.time() - t0
+        print(f" done ({dt:.1f}s)")
+
+    # --- Regression datasets ---
+    for ds_name in regression_datasets:
+        scenario_key = f"regression_{ds_name}"
+        scenario_names.append(scenario_key)
+        all_results[scenario_key] = []
+
+        print(f"  Running scenario: {scenario_key} ...", end="", flush=True)
+        t0 = time.time()
+
+        for rep in range(n_repetitions):
+            rep_seed = seed + rep * 1000
+            X_train, X_test, y_train, y_test = load_dataset(
+                ds_name, seed=rep_seed, test_size=0.3,
+            )
+
+            # Build and train regression model zoo
+            models = build_regression_zoo(seed=rep_seed)
+            train_zoo(models, X_train, y_train)
+
+            # Collect predictions on test set
+            preds_dict = collect_predictions_regression(models, X_test)
+
+            n_test = len(y_test)
+
+            # For ICM, use the mean prediction column (col 0) from each model
+            preds_dict_mean = {
+                name: preds_dict[name][:, 0] for name in preds_dict
+            }
+
+            # Compute per-sample ICM scores and squared errors
+            icm_scores = np.empty(n_test)
+            losses = np.empty(n_test)
+
+            for i in range(n_test):
+                sample_preds = {
+                    name: np.array([preds_dict_mean[name][i]])
+                    for name in preds_dict_mean
+                }
+                result = compute_icm_from_predictions(
+                    sample_preds, config=icm_config,
+                    distance_fn="wasserstein",
+                )
+                icm_scores[i] = result.icm_score
+
+                # Loss: squared error of ensemble mean
+                ensemble_mean = np.mean(
+                    [preds_dict_mean[name][i] for name in preds_dict_mean],
+                )
+                losses[i] = (ensemble_mean - y_test[i]) ** 2
+
+            diagnostics = verify_monotonicity(icm_scores, losses)
+            diagnostics["rep"] = rep
+            diagnostics["icm_range"] = (
+                float(icm_scores.min()), float(icm_scores.max()),
+            )
+            diagnostics["loss_range"] = (
+                float(losses.min()), float(losses.max()),
+            )
+
+            # Binned stats
+            n_bins = min(n_quantile_bins, n_test // 5)
+            n_bins = max(n_bins, 2)
+            bin_edges = np.percentile(icm_scores, np.linspace(0, 100, n_bins + 1))
+            per_bin_icm = []
+            per_bin_loss = []
+            for b in range(n_bins):
+                lo, hi = bin_edges[b], bin_edges[b + 1]
+                if b < n_bins - 1:
+                    mask = (icm_scores >= lo) & (icm_scores < hi)
+                else:
+                    mask = (icm_scores >= lo) & (icm_scores <= hi)
+                if mask.any():
+                    per_bin_icm.append(float(icm_scores[mask].mean()))
+                    per_bin_loss.append(float(losses[mask].mean()))
+
+            diagnostics["per_noise_icm"] = np.array(per_bin_icm)
+            diagnostics["per_noise_loss"] = np.array(per_bin_loss)
+            all_results[scenario_key].append(diagnostics)
+
+        dt = time.time() - t0
+        print(f" done ({dt:.1f}s)")
+
+    total_time = time.time() - t_start
+    print(f"\n  Total wall time: {total_time:.1f}s\n")
+
+    # ==================================================================
+    # Print results tables
+    # ==================================================================
+    print("=" * 78)
+    print("  DETAILED RESULTS PER REPETITION")
+    print("=" * 78)
+
+    for scenario_name in scenario_names:
+        print(f"\n  --- {scenario_name.upper()} ---")
+        header = (f"  {'Rep':>3s}  {'Spearman rho':>13s}  {'p-value':>10s}  "
+                  f"{'Iso R^2':>8s}  {'Violations':>10s}  {'Viol.Rate':>9s}  "
+                  f"{'ICM range':>17s}")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for d in all_results[scenario_name]:
+            imin, imax = d["icm_range"]
+            print(f"  {d['rep']:3d}  "
+                  f"{d['spearman_rho']:13.4f}  "
+                  f"{d['spearman_p']:10.2e}  "
+                  f"{d['iso_r2']:8.4f}  "
+                  f"{d['n_violations']:4d}/{d['max_violations']:<5d}  "
+                  f"{d['violation_rate']:9.4f}  "
+                  f"[{imin:.3f}, {imax:.3f}]")
+
+    # ==================================================================
+    # Aggregate statistics
+    # ==================================================================
+    print("\n" + "=" * 78)
+    print(f"  AGGREGATE STATISTICS (mean +/- std over {n_repetitions} repetitions)")
+    print("=" * 78)
+
+    summary_table: dict[str, dict[str, str]] = {}
+
+    header_agg = (f"  {'Scenario':>30s}  {'Spearman rho':>15s}  "
+                  f"{'p < 0.05':>8s}  {'Iso R^2':>15s}  "
+                  f"{'Viol. Rate':>15s}  {'PASS':>6s}")
+    print(header_agg)
+    print("  " + "-" * (len(header_agg) - 2))
+
+    all_pass = True
+    for scenario_name in scenario_names:
+        rhos = np.array([d["spearman_rho"] for d in all_results[scenario_name]])
+        ps = np.array([d["spearman_p"] for d in all_results[scenario_name]])
+        r2s = np.array([d["iso_r2"] for d in all_results[scenario_name]])
+        vrs = np.array([d["violation_rate"] for d in all_results[scenario_name]])
+
+        sig_frac = np.mean(ps < 0.05)
+        mean_rho = rhos.mean()
+        std_rho = rhos.std()
+        mean_r2 = r2s.mean()
+        std_r2 = r2s.std()
+        mean_vr = vrs.mean()
+        std_vr = vrs.std()
+
+        # PASS criteria:
+        #   - mean Spearman rho < -0.3
+        #   - >= 80% of reps have p < 0.05
+        #   - mean violation rate < 0.50
+        passed = (mean_rho < -0.3) and (sig_frac >= 0.8) and (mean_vr < 0.50)
+        if not passed:
+            all_pass = False
+
+        tag = "YES" if passed else "NO"
+
+        print(f"  {scenario_name:>30s}  "
+              f"{mean_rho:+7.4f} +/- {std_rho:.4f}  "
+              f"{sig_frac*100:6.0f}%   "
+              f"{mean_r2:6.4f} +/- {std_r2:.4f}  "
+              f"{mean_vr:6.4f} +/- {std_vr:.4f}  "
+              f"{tag:>6s}")
+
+        summary_table[scenario_name] = {
+            "mean_rho": f"{mean_rho:+.4f}",
+            "std_rho": f"{std_rho:.4f}",
+            "sig_frac": f"{sig_frac*100:.0f}%",
+            "mean_r2": f"{mean_r2:.4f}",
+            "std_r2": f"{std_r2:.4f}",
+            "mean_vr": f"{mean_vr:.4f}",
+            "std_vr": f"{std_vr:.4f}",
+            "pass": tag,
+        }
+
+    # ==================================================================
+    # Final verdict
+    # ==================================================================
+    print("\n" + "=" * 78)
+    if all_pass:
+        print("  VERDICT: PASS -- E[L|C] is monotonically non-increasing in C")
+        print("           across all scenarios (real models + real datasets).")
+    else:
+        print("  VERDICT: PARTIAL -- monotonicity holds in most but not all")
+        print("           scenarios.  See per-scenario results above for details.")
+    print("=" * 78)
+
+    return all_results, summary_table, all_pass
+
+
+# =====================================================================
 # Main experiment
 # =====================================================================
-def run_experiment():
+def run_experiment(use_real_models: bool = True):
     """Execute the full Q1 monotonicity experiment.
 
-    For each scenario, at each noise level, we run N_SUBTRIALS independent
-    sub-trials.  This yields N_NOISE_LEVELS * N_SUBTRIALS (icm, loss) pairs
-    per repetition.  We verify monotonicity on the full set of pairs.
+    Parameters
+    ----------
+    use_real_models : bool
+        When True (default), use genuinely diverse model families from the
+        model zoo trained on real datasets.  When False, use the legacy
+        synthetic noise-perturbation approach.
+
+    Returns
+    -------
+    (all_results, summary_table, all_pass)
     """
+    if use_real_models:
+        return _run_real_models_experiment()
+
+    # ---- Legacy (synthetic) approach below ----
+
     trial_fns = {
         "classification": run_classification_trial,
         "regression": run_regression_trial,

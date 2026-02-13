@@ -271,7 +271,7 @@ def compute_direction(signs_or_gradients: NDArray) -> float:
 
     probs = counts / counts.sum()
     H = float(_scipy_entropy(probs))  # natural log
-    H_max = float(np.log(K))
+    H_max = float(np.log(len(unique)))
 
     if H_max == 0.0:
         return 1.0

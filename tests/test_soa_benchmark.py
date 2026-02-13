@@ -400,20 +400,27 @@ class TestExperiment5:
         assert wide_range >= default_range
 
     def test_crc_thresholds_functional_wide_range(self, iris_data):
-        """Wide range preset should produce scores spanning ACT/DEFER/AUDIT zones."""
+        """Wide range preset should produce scores with meaningful spread.
+
+        Note: With the circularity fix (Pi=0 when no test labels used),
+        well-agreeing models on easy datasets like iris may all land in the
+        ACT zone.  The key property is that wide_range has a broader score
+        range than the default logistic, enabling better discrimination.
+        """
         X_train, X_test, y_train, y_test = iris_data
         exp5 = experiment_score_range(
             "iris", X_train, X_test, y_train, y_test,
             task="classification", seed=42,
         )
         wide_scores = exp5["wide_scores"]
-        # At least some scores should fall in different zones
+        default_scores = exp5["default_scores"]
         assert len(wide_scores) > 0
-        has_high = np.any(wide_scores >= 0.7)
-        has_low = np.any(wide_scores < 0.3)
-        # At least two zones should be populated (wide range is discriminative)
-        n_zones = sum([has_high, np.any((wide_scores >= 0.3) & (wide_scores < 0.7)), has_low])
-        assert n_zones >= 2, "Wide range should produce scores in at least 2 zones"
+        # Wide range should have more spread than default
+        wide_range = float(wide_scores.max() - wide_scores.min())
+        default_range = float(default_scores.max() - default_scores.min())
+        assert wide_range >= default_range, (
+            f"Wide range ({wide_range:.4f}) should be >= default range ({default_range:.4f})"
+        )
 
     def test_all_scores_in_zero_one(self, iris_data):
         """All ICM scores should be in [0, 1]."""
@@ -442,19 +449,17 @@ class TestICMScoreValidity:
         models = build_classification_zoo(seed=42)
         train_zoo(models, X_train, y_train)
         preds = collect_predictions_classification(models, X_test)
-        y_test_int = np.asarray(y_test, dtype=int)
 
         per_sample = _compute_per_sample_icm_classification(
-            preds, y_test_int, wide_config,
+            preds, wide_config,
         )
         assert np.all(per_sample >= 0.0)
         assert np.all(per_sample <= 1.0)
 
     def test_per_model_icm_in_range(self, iris_preds, iris_data, wide_config):
         """Per-model ICM contribution scores should be in [0.05, 0.95]."""
-        _, _, _, y_test = iris_data
         per_model = _compute_per_model_icm_classification(
-            iris_preds, y_test, wide_config,
+            iris_preds, wide_config,
         )
         for score in per_model.values():
             assert 0.05 <= score <= 0.95
@@ -480,10 +485,8 @@ class TestPredictionSets:
 
     def test_sets_nonempty(self, iris_preds, iris_data, wide_config):
         """All prediction sets should be non-empty."""
-        _, _, _, y_test = iris_data
-        y_test_int = np.asarray(y_test, dtype=int)
         per_sample = _compute_per_sample_icm_classification(
-            iris_preds, y_test_int, wide_config,
+            iris_preds, wide_config,
         )
         sets = _icm_prediction_sets_classification(iris_preds, per_sample)
         for ps in sets:
@@ -495,7 +498,7 @@ class TestPredictionSets:
         y_test_int = np.asarray(y_test, dtype=int)
         n_classes = len(np.unique(y_test_int))
         per_sample = _compute_per_sample_icm_classification(
-            iris_preds, y_test_int, wide_config,
+            iris_preds, wide_config,
         )
         sets = _icm_prediction_sets_classification(iris_preds, per_sample)
         for ps in sets:
