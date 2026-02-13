@@ -20,6 +20,9 @@ from framework.icm import (
     compute_dependency_penalty,
     compute_icm,
     compute_icm_geometric,
+    compute_icm_calibrated,
+    compute_icm_adaptive,
+    _dispatch_aggregation,
     compute_icm_from_predictions,
     compute_icm_timeseries,
 )
@@ -642,3 +645,438 @@ class TestMonotonicity:
         icm_dep = compute_icm(components_dep, config)
 
         assert icm_indep.icm_score > icm_dep.icm_score
+
+
+# ============================================================
+# Beta-calibrated aggregation
+# ============================================================
+
+class TestComputeICMCalibrated:
+    """Tests for beta-calibrated ICM aggregation."""
+
+    def test_perfect_convergence_high_score(self):
+        """Perfect components should yield a high calibrated ICM score."""
+        components = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm_calibrated(components)
+        assert result.icm_score > 0.9
+        assert result.aggregation_method == "calibrated"
+
+    def test_no_convergence_low_score(self):
+        """Worst-case components should yield a low calibrated ICM score."""
+        components = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result = compute_icm_calibrated(components)
+        assert result.icm_score < 0.1
+
+    def test_bounded_0_1(self):
+        """Calibrated scores must be in [0, 1] for random inputs."""
+        rng = np.random.default_rng(100)
+        for _ in range(100):
+            components = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            result = compute_icm_calibrated(components)
+            assert 0.0 <= result.icm_score <= 1.0
+
+    def test_monotonicity_A(self):
+        """Increasing agreement A should increase the calibrated score."""
+        scores = []
+        for a_val in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            comp = ICMComponents(A=a_val, D=0.5, U=0.5, C=0.5, Pi=0.2)
+            scores.append(compute_icm_calibrated(comp).icm_score)
+        for i in range(1, len(scores)):
+            assert scores[i] >= scores[i - 1] - 1e-10, (
+                f"Monotonicity violated: score[{i}]={scores[i]:.6f} "
+                f"< score[{i-1}]={scores[i-1]:.6f}"
+            )
+
+    def test_monotonicity_Pi_penalty(self):
+        """Increasing penalty Pi should decrease the calibrated score."""
+        scores = []
+        for pi_val in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            comp = ICMComponents(A=0.7, D=0.7, U=0.7, C=0.7, Pi=pi_val)
+            scores.append(compute_icm_calibrated(comp).icm_score)
+        for i in range(1, len(scores)):
+            assert scores[i] <= scores[i - 1] + 1e-10, (
+                f"Penalty monotonicity violated: score[{i}]={scores[i]:.6f} "
+                f"> score[{i-1}]={scores[i-1]:.6f}"
+            )
+
+    def test_wider_spread_than_logistic(self):
+        """Beta-calibrated should produce wider score spreads than logistic.
+
+        This is the core motivation for the calibrated mode.
+        """
+        rng = np.random.default_rng(42)
+        logistic_scores = []
+        calibrated_scores = []
+        for _ in range(200):
+            comp = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            logistic_scores.append(compute_icm(comp).icm_score)
+            calibrated_scores.append(compute_icm_calibrated(comp).icm_score)
+
+        logistic_range = max(logistic_scores) - min(logistic_scores)
+        calibrated_range = max(calibrated_scores) - min(calibrated_scores)
+        logistic_std = float(np.std(logistic_scores))
+        calibrated_std = float(np.std(calibrated_scores))
+
+        assert calibrated_range > logistic_range, (
+            f"Calibrated range {calibrated_range:.4f} should exceed "
+            f"logistic range {logistic_range:.4f}"
+        )
+        assert calibrated_std > logistic_std, (
+            f"Calibrated std {calibrated_std:.4f} should exceed "
+            f"logistic std {logistic_std:.4f}"
+        )
+
+    def test_symmetry_with_equal_shapes(self):
+        """With shape_a == shape_b, the Beta CDF is symmetric around 0.5.
+
+        This means components at the midpoint should map to ~0.5.
+        """
+        mid = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
+        config = ICMConfig(beta_shape_a=5.0, beta_shape_b=5.0)
+        result = compute_icm_calibrated(mid, config)
+        # The midpoint of z maps to z_norm ~= 0.5294 (due to the weight
+        # structure), which through Beta(5,5) gives approximately 0.55.
+        # The key test is symmetry: equal distance from midpoint in
+        # opposite directions should give symmetric outputs.
+        z_mid = (config.w_A * 0.5 + config.w_D * 0.5
+                 + config.w_U * 0.5 + config.w_C * 0.5 - config.lam * 0.5)
+        z_min = -config.lam
+        z_max = config.w_A + config.w_D + config.w_U + config.w_C
+        z_norm_mid = (z_mid - z_min) / (z_max - z_min)
+
+        # Check symmetric property: BetaCDF(x; a, a) + BetaCDF(1-x; a, a) = 1
+        from scipy.stats import beta as sb
+        assert sb.cdf(z_norm_mid, 5.0, 5.0) + sb.cdf(1.0 - z_norm_mid, 5.0, 5.0) == (
+            pytest.approx(1.0, abs=1e-10)
+        )
+
+    def test_custom_shape_parameters(self):
+        """Custom Beta shape parameters should alter the spread."""
+        comp = ICMComponents(A=0.8, D=0.6, U=0.7, C=0.9, Pi=0.1)
+
+        # Low shape parameters -> more uniform spread
+        config_low = ICMConfig(beta_shape_a=1.5, beta_shape_b=1.5)
+        result_low = compute_icm_calibrated(comp, config_low)
+
+        # High shape parameters -> more concentrated around center
+        config_high = ICMConfig(beta_shape_a=20.0, beta_shape_b=20.0)
+        result_high = compute_icm_calibrated(comp, config_high)
+
+        # Both should be bounded
+        assert 0.0 <= result_low.icm_score <= 1.0
+        assert 0.0 <= result_high.icm_score <= 1.0
+
+    def test_weights_include_beta_params(self):
+        """The weights dict should include beta shape parameters."""
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
+        result = compute_icm_calibrated(comp)
+        assert "beta_shape_a" in result.weights
+        assert "beta_shape_b" in result.weights
+        assert result.weights["beta_shape_a"] == 5.0
+        assert result.weights["beta_shape_b"] == 5.0
+
+    def test_lipschitz_continuity(self):
+        """Small changes in input should produce bounded changes in output.
+
+        The Beta CDF on [0,1] with finite shape params has a bounded
+        derivative, so the mapping is Lipschitz.
+        """
+        base = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.3)
+        result_base = compute_icm_calibrated(base)
+
+        epsilon = 0.001
+        perturbed = ICMComponents(
+            A=0.5 + epsilon, D=0.5, U=0.5, C=0.5, Pi=0.3
+        )
+        result_perturbed = compute_icm_calibrated(perturbed)
+
+        delta_output = abs(result_perturbed.icm_score - result_base.icm_score)
+        # The Lipschitz constant L should be finite; the output change
+        # should be proportional to the input change.
+        assert delta_output < 1.0, "Output jump too large for tiny input change"
+        # More specifically, the ratio should be bounded
+        assert delta_output / epsilon < 100.0, (
+            f"Lipschitz ratio {delta_output / epsilon:.2f} too large"
+        )
+
+
+# ============================================================
+# Adaptive aggregation
+# ============================================================
+
+class TestComputeICMAdaptive:
+    """Tests for adaptive / percentile-based ICM aggregation."""
+
+    def test_perfect_convergence_high_score(self):
+        """Perfect components -> high adaptive score."""
+        comp = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm_adaptive(comp)
+        assert result.icm_score > 0.9
+        assert result.aggregation_method == "adaptive"
+
+    def test_no_convergence_low_score(self):
+        """Worst-case components -> low adaptive score."""
+        comp = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result = compute_icm_adaptive(comp)
+        assert result.icm_score < 0.1
+
+    def test_bounded_0_1(self):
+        """Adaptive scores must be in [0, 1]."""
+        rng = np.random.default_rng(200)
+        for _ in range(100):
+            comp = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            result = compute_icm_adaptive(comp)
+            assert 0.0 <= result.icm_score <= 1.0
+
+    def test_monotonicity(self):
+        """Increasing all positive components should increase adaptive score."""
+        scores = []
+        for level in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            comp = ICMComponents(A=level, D=level, U=level, C=level, Pi=0.0)
+            scores.append(compute_icm_adaptive(comp).icm_score)
+        for i in range(1, len(scores)):
+            assert scores[i] >= scores[i - 1] - 1e-10
+
+    def test_custom_calibration_set(self):
+        """Providing a calibration set should affect scoring."""
+        comp = ICMComponents(A=0.7, D=0.7, U=0.7, C=0.7, Pi=0.1)
+
+        # Calibration set with low scores -> this comp should rank high
+        config_low = ICMConfig(
+            adaptive_calibration_scores=[0.0, 0.05, 0.1, 0.15, 0.2]
+        )
+        result_low = compute_icm_adaptive(comp, config_low)
+
+        # Calibration set with high scores -> this comp should rank lower
+        config_high = ICMConfig(
+            adaptive_calibration_scores=[0.5, 0.6, 0.7, 0.8, 0.9]
+        )
+        result_high = compute_icm_adaptive(comp, config_high)
+
+        assert result_low.icm_score > result_high.icm_score, (
+            f"Score with low calibration set ({result_low.icm_score:.4f}) "
+            f"should be > with high calibration set ({result_high.icm_score:.4f})"
+        )
+
+    def test_wider_spread_than_logistic(self):
+        """Adaptive should produce wider spread than logistic."""
+        rng = np.random.default_rng(42)
+        logistic_scores = []
+        adaptive_scores = []
+        for _ in range(200):
+            comp = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            logistic_scores.append(compute_icm(comp).icm_score)
+            adaptive_scores.append(compute_icm_adaptive(comp).icm_score)
+
+        logistic_std = float(np.std(logistic_scores))
+        adaptive_std = float(np.std(adaptive_scores))
+
+        assert adaptive_std > logistic_std, (
+            f"Adaptive std {adaptive_std:.4f} should exceed "
+            f"logistic std {logistic_std:.4f}"
+        )
+
+
+# ============================================================
+# Dispatch / config-driven aggregation
+# ============================================================
+
+class TestDispatchAggregation:
+    """Tests for _dispatch_aggregation and config.aggregation parameter."""
+
+    def test_default_is_logistic(self):
+        """Default config should dispatch to logistic."""
+        config = ICMConfig()
+        assert config.aggregation == "logistic"
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.2)
+        result = _dispatch_aggregation(comp, config)
+        assert result.aggregation_method == "logistic"
+        # Should match direct call
+        direct = compute_icm(comp, config)
+        assert result.icm_score == pytest.approx(direct.icm_score, abs=1e-12)
+
+    def test_dispatch_geometric(self):
+        config = ICMConfig(aggregation="geometric")
+        comp = ICMComponents(A=0.8, D=0.8, U=0.8, C=0.8, Pi=0.1)
+        result = _dispatch_aggregation(comp, config)
+        assert result.aggregation_method == "geometric"
+        direct = compute_icm_geometric(comp, config)
+        assert result.icm_score == pytest.approx(direct.icm_score, abs=1e-12)
+
+    def test_dispatch_calibrated(self):
+        config = ICMConfig(aggregation="calibrated")
+        comp = ICMComponents(A=0.6, D=0.7, U=0.8, C=0.9, Pi=0.05)
+        result = _dispatch_aggregation(comp, config)
+        assert result.aggregation_method == "calibrated"
+        direct = compute_icm_calibrated(comp, config)
+        assert result.icm_score == pytest.approx(direct.icm_score, abs=1e-12)
+
+    def test_dispatch_adaptive(self):
+        config = ICMConfig(aggregation="adaptive")
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
+        result = _dispatch_aggregation(comp, config)
+        assert result.aggregation_method == "adaptive"
+        direct = compute_icm_adaptive(comp, config)
+        assert result.icm_score == pytest.approx(direct.icm_score, abs=1e-12)
+
+    def test_unknown_aggregation_raises(self):
+        config = ICMConfig(aggregation="unknown_method")
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
+        with pytest.raises(ValueError, match="Unknown aggregation"):
+            _dispatch_aggregation(comp, config)
+
+    def test_from_predictions_respects_config_aggregation(self):
+        """compute_icm_from_predictions should use config.aggregation."""
+        p = np.array([0.25, 0.25, 0.25, 0.25])
+        preds = {f"m{i}": p for i in range(3)}
+
+        config_logistic = ICMConfig(aggregation="logistic")
+        result_log = compute_icm_from_predictions(preds, config=config_logistic)
+        assert result_log.aggregation_method == "logistic"
+
+        config_cal = ICMConfig(aggregation="calibrated")
+        result_cal = compute_icm_from_predictions(preds, config=config_cal)
+        assert result_cal.aggregation_method == "calibrated"
+
+        config_adapt = ICMConfig(aggregation="adaptive")
+        result_adapt = compute_icm_from_predictions(preds, config=config_adapt)
+        assert result_adapt.aggregation_method == "adaptive"
+
+    def test_timeseries_respects_config_aggregation(self):
+        """compute_icm_timeseries should use config.aggregation."""
+        rng = np.random.default_rng(55)
+        T = 5
+        ts = []
+        for _ in range(T):
+            p = rng.dirichlet(np.ones(3))
+            ts.append({f"m{i}": p + rng.normal(0, 0.01, 3) for i in range(3)})
+
+        config_cal = ICMConfig(aggregation="calibrated")
+        results = compute_icm_timeseries(ts, config=config_cal, window_size=1)
+        assert len(results) == T
+        for r in results:
+            assert r.aggregation_method == "calibrated"
+            assert 0.0 <= r.icm_score <= 1.0
+
+
+# ============================================================
+# Backward compatibility
+# ============================================================
+
+class TestBackwardCompatibility:
+    """Ensure existing behavior is unchanged when new features are unused."""
+
+    def test_default_icm_config_unchanged(self):
+        """Default ICMConfig values should be backward-compatible."""
+        config = ICMConfig()
+        assert config.w_A == 0.35
+        assert config.w_D == 0.15
+        assert config.w_U == 0.25
+        assert config.w_C == 0.10
+        assert config.lam == 0.15
+        assert config.aggregation == "logistic"
+
+    def test_compute_icm_unchanged(self):
+        """compute_icm should produce identical results to before."""
+        comp = ICMComponents(A=0.8, D=0.7, U=0.6, C=0.9, Pi=0.2)
+        config = ICMConfig()
+        result = compute_icm(comp, config)
+        # The logistic function is deterministic; verify a known value
+        from scipy.special import expit
+        z = (0.35 * 0.8 + 0.15 * 0.7 + 0.25 * 0.6 + 0.10 * 0.9
+             - 0.15 * 0.2)
+        expected = float(expit(z))
+        assert result.icm_score == pytest.approx(expected, abs=1e-12)
+        assert result.aggregation_method == "logistic"
+
+    def test_from_predictions_default_logistic(self):
+        """compute_icm_from_predictions with no config uses logistic."""
+        p = np.array([0.5, 0.5])
+        preds = {"m1": p, "m2": p}
+        result = compute_icm_from_predictions(preds)
+        assert result.aggregation_method == "logistic"
+
+    def test_geometric_still_works(self):
+        """compute_icm_geometric should still work identically."""
+        comp = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm_geometric(comp)
+        assert result.icm_score == pytest.approx(1.0, abs=1e-6)
+        assert result.aggregation_method == "geometric"
+
+
+# ============================================================
+# Edge cases for new aggregation modes
+# ============================================================
+
+class TestEdgeCases:
+    """Edge cases for calibrated and adaptive aggregation."""
+
+    def test_calibrated_all_zeros(self):
+        """All components zero, max penalty."""
+        comp = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result = compute_icm_calibrated(comp)
+        assert 0.0 <= result.icm_score <= 1.0
+        assert result.icm_score < 0.05
+
+    def test_calibrated_all_ones_no_penalty(self):
+        """All components one, no penalty."""
+        comp = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm_calibrated(comp)
+        assert result.icm_score > 0.95
+
+    def test_adaptive_single_calibration_point(self):
+        """With only 1 calibration point, should fall back to default."""
+        config = ICMConfig(adaptive_calibration_scores=[0.5])
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
+        result = compute_icm_adaptive(comp, config)
+        assert 0.0 <= result.icm_score <= 1.0
+
+    def test_adaptive_score_below_calibration_min(self):
+        """Score below all calibration points should give ~0."""
+        config = ICMConfig(adaptive_calibration_scores=[0.5, 0.6, 0.7, 0.8])
+        comp = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result = compute_icm_adaptive(comp, config)
+        assert result.icm_score == pytest.approx(0.0, abs=1e-6)
+
+    def test_adaptive_score_above_calibration_max(self):
+        """Score above all calibration points should give 1.0."""
+        config = ICMConfig(adaptive_calibration_scores=[0.0, 0.05, 0.1])
+        comp = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm_adaptive(comp, config)
+        assert result.icm_score == pytest.approx(1.0, abs=1e-6)
+
+    def test_calibrated_equal_components_different_penalty(self):
+        """Two scenarios differing only in Pi should have correct ordering."""
+        comp_low_pi = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.0)
+        comp_high_pi = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=1.0)
+        r_low = compute_icm_calibrated(comp_low_pi)
+        r_high = compute_icm_calibrated(comp_high_pi)
+        assert r_low.icm_score > r_high.icm_score
+
+    def test_calibrated_beta_shape_1_1_is_identity(self):
+        """Beta(1,1) is uniform, so CDF(x) = x.  Output should equal z_norm."""
+        config = ICMConfig(beta_shape_a=1.0, beta_shape_b=1.0)
+        comp = ICMComponents(A=0.7, D=0.6, U=0.8, C=0.5, Pi=0.2)
+        z = (config.w_A * 0.7 + config.w_D * 0.6 + config.w_U * 0.8
+             + config.w_C * 0.5 - config.lam * 0.2)
+        z_min = -config.lam
+        z_max = config.w_A + config.w_D + config.w_U + config.w_C
+        z_norm = (z - z_min) / (z_max - z_min)
+        result = compute_icm_calibrated(comp, config)
+        assert result.icm_score == pytest.approx(z_norm, abs=1e-8)

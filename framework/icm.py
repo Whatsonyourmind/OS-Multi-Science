@@ -13,6 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import linalg as la
 from scipy.special import expit
+from scipy.stats import beta as _scipy_beta
 from scipy.stats import entropy as _scipy_entropy
 
 from framework.config import ICMConfig
@@ -535,6 +536,227 @@ def compute_icm_geometric(
     )
 
 
+def compute_icm_calibrated(
+    components: ICMComponents,
+    config: ICMConfig | None = None,
+) -> ICMResult:
+    """Beta-calibrated ICM aggregation.
+
+    Maps the weighted linear combination through a Beta CDF instead of
+    a logistic sigmoid.  The Beta CDF is monotonic, bounded in [0, 1],
+    smooth (and therefore Lipschitz-continuous on [0, 1]), and symmetric
+    when shape_a == shape_b.
+
+    Compared to the logistic sigmoid, which compresses typical scores
+    into a narrow band around 0.5, the Beta CDF (with appropriate shape
+    parameters) spreads the output across the full [0, 1] range, giving
+    the downstream ACT/DEFER/AUDIT decision gate much better
+    discrimination power.
+
+    Formula
+    -------
+    z = w_A*A + w_D*D + w_U*U + w_C*C - lambda*Pi
+    z_norm = clip(z / z_max, 0, 1)          # normalize to [0, 1]
+    ICM = BetaCDF(z_norm; shape_a, shape_b)
+
+    where z_max = w_A + w_D + w_U + w_C  (maximum possible z when all
+    components are 1 and Pi is 0).
+
+    Parameters
+    ----------
+    components : ICMComponents with fields A, D, U, C, Pi.
+    config     : ICMConfig with weights, lambda, beta_shape_a, beta_shape_b.
+
+    Returns
+    -------
+    ICMResult
+    """
+    if config is None:
+        config = ICMConfig()
+
+    z = (
+        config.w_A * components.A
+        + config.w_D * components.D
+        + config.w_U * components.U
+        + config.w_C * components.C
+        - config.lam * components.Pi
+    )
+
+    # Normalize z to [0, 1].  The theoretical range of z is
+    # [-lam, w_A + w_D + w_U + w_C] (all components in [0,1], Pi in [0,1]).
+    z_min = -config.lam
+    z_max = config.w_A + config.w_D + config.w_U + config.w_C
+    denom = z_max - z_min
+    if denom < 1e-12:
+        z_norm = 0.5
+    else:
+        z_norm = (z - z_min) / denom
+    z_norm = float(np.clip(z_norm, 0.0, 1.0))
+
+    # Apply Beta CDF
+    icm_score = float(_scipy_beta.cdf(z_norm, config.beta_shape_a, config.beta_shape_b))
+
+    weights = {
+        "w_A": config.w_A,
+        "w_D": config.w_D,
+        "w_U": config.w_U,
+        "w_C": config.w_C,
+        "lam": config.lam,
+        "beta_shape_a": config.beta_shape_a,
+        "beta_shape_b": config.beta_shape_b,
+    }
+
+    return ICMResult(
+        icm_score=float(np.clip(icm_score, 0.0, 1.0)),
+        components=components,
+        aggregation_method="calibrated",
+        weights=weights,
+    )
+
+
+def compute_icm_adaptive(
+    components: ICMComponents,
+    config: ICMConfig | None = None,
+) -> ICMResult:
+    """Adaptive / percentile-based ICM aggregation.
+
+    Uses a calibration set of historical raw linear scores to determine
+    the empirical CDF, then maps the current score to its percentile
+    rank within that distribution.  This guarantees output uniformity
+    over the calibration distribution, maximizing discrimination.
+
+    When no calibration set is provided in
+    ``config.adaptive_calibration_scores``, falls back to a default
+    reference distribution generated from a uniform grid over the
+    component space.
+
+    Formal properties
+    -----------------
+    - **Monotonic**: the percentile rank is a monotone function of the
+      raw score.
+    - **Bounded in [0, 1]**: by definition.
+    - **Symmetric**: the mapping is symmetric if the calibration
+      distribution is symmetric.
+    - **Lipschitz**: the empirical CDF is 1/N-Lipschitz (piecewise
+      constant), and interpolation yields a Lipschitz-continuous
+      approximation.
+
+    Parameters
+    ----------
+    components : ICMComponents with fields A, D, U, C, Pi.
+    config     : ICMConfig with weights, lambda, and optionally
+                 adaptive_calibration_scores.
+
+    Returns
+    -------
+    ICMResult
+    """
+    if config is None:
+        config = ICMConfig()
+
+    z = (
+        config.w_A * components.A
+        + config.w_D * components.D
+        + config.w_U * components.U
+        + config.w_C * components.C
+        - config.lam * components.Pi
+    )
+
+    cal_scores = config.adaptive_calibration_scores
+
+    if cal_scores is None or len(cal_scores) < 2:
+        # Generate a default calibration set by sampling the component
+        # space on a regular grid.  This gives a stable reference
+        # distribution that covers the full range.
+        rng = np.random.default_rng(0)
+        n_samples = 500
+        default_scores: list[float] = []
+        for _ in range(n_samples):
+            a = rng.uniform(0, 1)
+            d = rng.uniform(0, 1)
+            u = rng.uniform(0, 1)
+            c = rng.uniform(0, 1)
+            pi = rng.uniform(0, 1)
+            s = (
+                config.w_A * a
+                + config.w_D * d
+                + config.w_U * u
+                + config.w_C * c
+                - config.lam * pi
+            )
+            default_scores.append(s)
+        cal_scores = default_scores
+
+    sorted_cal = np.sort(cal_scores)
+    n = len(sorted_cal)
+
+    # Compute percentile rank via linear interpolation for smoothness.
+    # searchsorted gives the insertion index; dividing by n gives the
+    # empirical CDF value.
+    idx = np.searchsorted(sorted_cal, z, side="right")
+    # Linear interpolation between neighboring calibration points
+    if idx <= 0:
+        icm_score = 0.0
+    elif idx >= n:
+        icm_score = 1.0
+    else:
+        # Interpolate between sorted_cal[idx-1] and sorted_cal[idx]
+        lo = sorted_cal[idx - 1]
+        hi = sorted_cal[idx]
+        if hi - lo < 1e-12:
+            icm_score = idx / n
+        else:
+            frac = (z - lo) / (hi - lo)
+            icm_score = (idx - 1 + frac) / n
+    icm_score = float(np.clip(icm_score, 0.0, 1.0))
+
+    weights = {
+        "w_A": config.w_A,
+        "w_D": config.w_D,
+        "w_U": config.w_U,
+        "w_C": config.w_C,
+        "lam": config.lam,
+    }
+
+    return ICMResult(
+        icm_score=icm_score,
+        components=components,
+        aggregation_method="adaptive",
+        weights=weights,
+    )
+
+
+def _dispatch_aggregation(
+    components: ICMComponents,
+    config: ICMConfig,
+) -> ICMResult:
+    """Dispatch to the appropriate aggregation function based on config.
+
+    Parameters
+    ----------
+    components : ICMComponents
+    config     : ICMConfig (uses config.aggregation to select method)
+
+    Returns
+    -------
+    ICMResult
+    """
+    method = config.aggregation
+    if method == "logistic":
+        return compute_icm(components, config)
+    elif method == "geometric":
+        return compute_icm_geometric(components, config)
+    elif method == "calibrated":
+        return compute_icm_calibrated(components, config)
+    elif method == "adaptive":
+        return compute_icm_adaptive(components, config)
+    else:
+        raise ValueError(
+            f"Unknown aggregation method: {method!r}.  "
+            f"Choose from 'logistic', 'geometric', 'calibrated', 'adaptive'."
+        )
+
+
 # ============================================================
 # 4. Convenience / high-level functions
 # ============================================================
@@ -620,7 +842,7 @@ def compute_icm_from_predictions(
     )
 
     components = ICMComponents(A=A, D=D, U=U, C=C_val, Pi=Pi)
-    result = compute_icm(components, config)
+    result = _dispatch_aggregation(components, config)
     result.n_models = K
     return result
 
@@ -666,6 +888,8 @@ def compute_icm_timeseries(
         merged_dict: dict[str, NDArray] = {
             name: np.concatenate(arrs) for name, arrs in merged.items()
         }
+        # compute_icm_from_predictions uses _dispatch_aggregation
+        # internally, so the aggregation mode from config is respected.
         result = compute_icm_from_predictions(
             merged_dict, config=config, distance_fn=distance_fn
         )

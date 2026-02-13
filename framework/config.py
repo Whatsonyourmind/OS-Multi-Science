@@ -1,5 +1,7 @@
 """Configuration management for OS Multi-Science."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -25,6 +27,16 @@ class ICMConfig:
 
     # Kernel parameters
     mmd_bandwidth: float = 1.0  # RBF kernel bandwidth for MMD
+
+    # Aggregation mode: "logistic" (default), "geometric", "calibrated", "adaptive"
+    aggregation: str = "logistic"
+
+    # Beta-calibrated aggregation parameters
+    beta_shape_a: float = 5.0  # Beta CDF shape parameter a
+    beta_shape_b: float = 5.0  # Beta CDF shape parameter b
+
+    # Adaptive aggregation calibration set (list of raw linear scores)
+    adaptive_calibration_scores: list[float] | None = None
 
 
 @dataclass
