@@ -213,6 +213,7 @@ def calibrate_thresholds(
     L_cal: np.ndarray,
     target_coverage: float = 0.80,
     alpha: float = 0.10,
+    seed: int = 42,
 ) -> tuple[float, float]:
     """Find tau_hi and tau_lo that achieve *target_coverage* at level alpha.
 
@@ -232,6 +233,8 @@ def calibrate_thresholds(
         Desired coverage (fraction of instances with ICM >= tau_lo).
     alpha : float
         Risk level.
+    seed : int
+        Random seed for reproducibility.
 
     Returns
     -------
@@ -242,7 +245,8 @@ def calibrate_thresholds(
 
     # Split calibration data in half for fit vs. conformal
     n = len(C_cal)
-    idx = np.random.permutation(n)
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
     mid = n // 2
     fit_idx, conf_idx = idx[:mid], idx[mid:]
 

@@ -40,6 +40,8 @@ def hellinger_distance(p: NDArray, q: NDArray) -> float:
     """
     p = np.asarray(p, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64)
+    if np.any(p < 0) or np.any(q < 0):
+        raise ValueError("Distribution entries must be non-negative")
     if p.shape != q.shape:
         raise ValueError(f"Shape mismatch: p {p.shape} vs q {q.shape}")
     sq_diff = (np.sqrt(p) - np.sqrt(q)) ** 2
@@ -196,8 +198,8 @@ def compute_agreement(
 ) -> float:
     """Distributional agreement A_i.
 
-    Compute pairwise distances among K model predictions, take the median,
-    normalize by C_A, and map to [0, 1] via  A = 1 - median_d / C_A.
+    Compute pairwise distances among K model predictions, take the mean,
+    normalize by C_A, and map to [0, 1] via  A = 1 - mean_d / C_A.
 
     Parameters
     ----------
@@ -233,8 +235,8 @@ def compute_agreement(
         for j in range(i + 1, K):
             dists.append(dist_fn(predictions[i], predictions[j]))
 
-    median_d = float(np.median(dists))
-    A = 1.0 - min(median_d / C_A, 1.0)
+    mean_d = float(np.mean(dists))
+    A = 1.0 - min(mean_d / C_A, 1.0)
     return float(np.clip(A, 0.0, 1.0))
 
 
@@ -264,13 +266,12 @@ def compute_direction(signs_or_gradients: NDArray) -> float:
 
     # Empirical distribution over unique sign values
     unique, counts = np.unique(signs, return_counts=True)
-    n_categories = len(unique)
-    if n_categories <= 1:
+    if len(unique) <= 1:
         return 1.0  # All agree
 
     probs = counts / counts.sum()
     H = float(_scipy_entropy(probs))  # natural log
-    H_max = float(np.log(n_categories))
+    H_max = float(np.log(K))
 
     if H_max == 0.0:
         return 1.0
@@ -445,12 +446,19 @@ def compute_icm(
 ) -> ICMResult:
     """Logistic ICM aggregation.
 
-    ICM = sigma(w_A*A + w_D*D + w_U*U + w_C*C - lambda*Pi)
+    ICM = sigma(scale * (z_raw - shift))
+
+    where z_raw = w_A*A + w_D*D + w_U*U + w_C*C - lambda*Pi.
+
+    When scale=1 and shift=0 (the defaults), this reduces to the legacy
+    formula ``sigma(z_raw)``.  Use ``ICMConfig.wide_range_preset()`` for
+    scale=10, shift=0.5 which spreads scores across the full [0, 1]
+    range instead of the narrow ~[0.46, 0.70] band.
 
     Parameters
     ----------
     components : ICMComponents with fields A, D, U, C, Pi.
-    config     : ICMConfig with weights and lambda.
+    config     : ICMConfig with weights, lambda, scale, and shift.
 
     Returns
     -------
@@ -459,13 +467,16 @@ def compute_icm(
     if config is None:
         config = ICMConfig()
 
-    z = (
+    z_raw = (
         config.w_A * components.A
         + config.w_D * components.D
         + config.w_U * components.U
         + config.w_C * components.C
         - config.lam * components.Pi
     )
+    # Apply scale and shift for better sigmoid utilization.
+    # Legacy defaults (scale=1.0, shift=0.0) give z == z_raw.
+    z = config.logistic_scale * (z_raw - config.logistic_shift)
     icm_score = float(expit(z))
 
     weights = {
@@ -761,6 +772,74 @@ def _dispatch_aggregation(
 # 4. Convenience / high-level functions
 # ============================================================
 
+def compute_pi_from_predictions(
+    predictions: dict[str, NDArray],
+    y_true: NDArray,
+    config: ICMConfig | None = None,
+) -> float:
+    """Compute Pi (dependency penalty) from model predictions and ground truth.
+
+    Extracts residuals from each model's predictions by subtracting the
+    ground truth, then computes the dependency penalty using Ledoit-Wolf
+    shrinkage estimation of inter-model residual correlation.
+
+    For classification (probability vectors), residuals are computed as
+    ``predicted_proba - one_hot(y_true)`` when predictions are 2-D, or
+    ``predicted - y_true`` for 1-D predictions (regression or scalar
+    classification outputs).
+
+    Parameters
+    ----------
+    predictions : dict mapping model names to prediction arrays.
+        Each value can be:
+        - 1-D array of length n (regression or scalar predictions)
+        - 2-D array of shape (n, C) (classification probabilities)
+    y_true : 1-D array of ground truth values.
+        For regression: continuous targets.
+        For classification: integer class labels (used to build one-hot).
+    config : ICMConfig for dependency penalty sub-weights.
+
+    Returns
+    -------
+    float  Pi in [0, 1].
+    """
+    if config is None:
+        config = ICMConfig()
+
+    y_true = np.asarray(y_true, dtype=np.float64).ravel()
+    n = len(y_true)
+
+    model_names = list(predictions.keys())
+    if len(model_names) < 2:
+        return 0.0
+
+    residual_rows: list[NDArray] = []
+    for name in model_names:
+        pred = np.asarray(predictions[name], dtype=np.float64)
+
+        if pred.ndim == 2 and pred.shape[1] > 1:
+            # Classification probabilities: (n, C) -> flatten residuals
+            n_classes = pred.shape[1]
+            # Build one-hot from y_true
+            y_int = y_true.astype(int)
+            y_int = np.clip(y_int, 0, n_classes - 1)
+            one_hot = np.zeros((n, n_classes), dtype=np.float64)
+            one_hot[np.arange(n), y_int] = 1.0
+            resid = (pred[:n] - one_hot).ravel()
+        else:
+            # Regression or 1-D predictions
+            pred_flat = pred.ravel()[:n]
+            resid = pred_flat - y_true[:len(pred_flat)]
+
+        residual_rows.append(resid)
+
+    # Truncate to common length
+    min_len = min(len(r) for r in residual_rows)
+    residuals = np.stack([r[:min_len] for r in residual_rows])
+
+    return compute_dependency_penalty(residuals=residuals, config=config)
+
+
 def compute_icm_from_predictions(
     predictions_dict: dict[str, NDArray],
     config: ICMConfig | None = None,
@@ -772,6 +851,7 @@ def compute_icm_from_predictions(
     residuals: NDArray | None = None,
     features: Sequence[set[str]] | None = None,
     gradients: NDArray | None = None,
+    y_true: NDArray | None = None,
 ) -> ICMResult:
     """Compute full ICM from a dict of {model_name: predictions_array}.
 
@@ -787,6 +867,10 @@ def compute_icm_from_predictions(
     signs : optional 1-D array of gradient signs for D.
     pre_scores, post_scores : optional for invariance C.
     residuals, features, gradients : optional for dependency penalty Pi.
+    y_true : optional ground truth array.  When provided *and* no
+        explicit residuals are given, Pi is automatically computed from
+        model predictions vs. ground truth via
+        ``compute_pi_from_predictions``.
 
     Returns
     -------
@@ -834,12 +918,25 @@ def compute_icm_from_predictions(
         C_val = 1.0  # Assume stable if no perturbation provided
 
     # --- Pi: dependency penalty ---
-    Pi = compute_dependency_penalty(
-        residuals=residuals,
-        features=features,
-        gradients=gradients,
-        config=config,
-    )
+    # Auto-compute Pi from y_true when no explicit residuals are provided.
+    if residuals is None and y_true is not None and K >= 2:
+        Pi = compute_pi_from_predictions(
+            predictions_dict, y_true, config=config,
+        )
+        # Still incorporate features/gradients if provided
+        if features is not None or gradients is not None:
+            Pi_extra = compute_dependency_penalty(
+                features=features, gradients=gradients, config=config,
+            )
+            # Blend: take the max to be conservative (higher penalty)
+            Pi = max(Pi, Pi_extra)
+    else:
+        Pi = compute_dependency_penalty(
+            residuals=residuals,
+            features=features,
+            gradients=gradients,
+            config=config,
+        )
 
     components = ICMComponents(A=A, D=D, U=U, C=C_val, Pi=Pi)
     result = _dispatch_aggregation(components, config)
@@ -934,8 +1031,8 @@ def _ledoit_wolf_corr(residuals: NDArray) -> NDArray:
     trace_S2 = float(np.trace(S @ S))
     trace_S_sq = float(np.trace(S) ** 2)
 
-    # Optimal shrinkage intensity (simplified Oracle Approximation)
-    numerator = (1.0 / n) * (trace_S2 + trace_S_sq) - (2.0 / K) * trace_S2
+    # Optimal shrinkage intensity (Oracle Approximation Shrinkage)
+    numerator = (1.0 - 2.0 / K) * trace_S2 + trace_S_sq
     denominator = (n + 1.0 - 2.0 / K) * (trace_S2 - trace_S_sq / K)
 
     if abs(denominator) < 1e-12:

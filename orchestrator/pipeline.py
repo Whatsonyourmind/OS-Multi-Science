@@ -504,7 +504,9 @@ class Pipeline:
             pred_dict[name] = np.asarray(preds, dtype=float)
 
         def _icm_fn(p: dict[str, np.ndarray]) -> float:
-            res = compute_icm_from_predictions(p, config=self.config.icm)
+            res = compute_icm_from_predictions(
+                p, config=self.config.icm, distance_fn="wasserstein",
+            )
             return res.icm_score
 
         return generate_anti_spurious_report(

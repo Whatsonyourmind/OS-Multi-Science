@@ -222,6 +222,7 @@ def evaluate_early_warning(
     detected_changes: list[int],
     true_changes: list[int],
     max_lead_time: int,
+    total_timesteps: int | None = None,
 ) -> dict[str, float | list[int]]:
     """Evaluate early-warning performance against known change-points.
 
@@ -236,11 +237,16 @@ def evaluate_early_warning(
         Time indices of actual changes.
     max_lead_time : int
         Maximum look-ahead window.
+    total_timesteps : int, optional
+        Total number of timesteps in the signal.  Used for computing
+        true negatives and proper FPR.  If None, estimated from detected
+        and true change indices.
 
     Returns
     -------
-    dict with 'auroc' (simplified), 'lead_times', 'false_positive_rate',
-    'true_positive_rate'.
+    dict with 'informedness', 'lead_times', 'false_positive_rate',
+    'true_positive_rate'.  Also includes legacy key 'auroc' (alias
+    for 'informedness') for backward compatibility.
     """
     detected = set(detected_changes)
     true_set = set(true_changes)
@@ -260,13 +266,24 @@ def evaluate_early_warning(
     n_fp = len(detected) - n_tp
 
     tpr = n_tp / max(len(true_set), 1)
-    fpr = n_fp / max(len(detected), 1) if detected else 0.0
 
-    # Simplified AUROC proxy (proper AUROC requires score thresholds)
-    auroc = tpr * (1 - fpr) if (tpr + fpr) > 0 else 0.5
+    # FPR = FP / (FP + TN) where TN is non-change timesteps without detection
+    if total_timesteps is not None:
+        n_non_change = total_timesteps - len(true_set)
+    else:
+        # Estimate total timesteps from the data
+        all_indices = list(detected) + list(true_set)
+        n_total = max(all_indices) + 1 if all_indices else 1
+        n_non_change = n_total - len(true_set)
+    n_tn = max(n_non_change - n_fp, 0)
+    fpr = n_fp / max(n_fp + n_tn, 1)
+
+    # Informedness (Youden's J statistic) = TPR - FPR
+    informedness = tpr - fpr if (tpr + fpr) > 0 else 0.0
 
     return {
-        "auroc": auroc,
+        "informedness": informedness,
+        "auroc": informedness,  # backward-compat alias
         "lead_times": tp_lead_times,
         "false_positive_rate": fpr,
         "true_positive_rate": tpr,

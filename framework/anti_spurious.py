@@ -26,6 +26,7 @@ def generate_negative_controls(
     features: np.ndarray,
     method: str = "label_shuffle",
     n_controls: int = 100,
+    seed: int = 42,
 ) -> list[np.ndarray]:
     """Generate negative-control prediction sets that destroy genuine signal.
 
@@ -41,6 +42,8 @@ def generate_negative_controls(
         How to destroy signal.
     n_controls : int
         Number of negative-control sets to generate.
+    seed : int
+        Random seed for reproducibility.
 
     Returns
     -------
@@ -52,23 +55,27 @@ def generate_negative_controls(
     features = np.asarray(features, dtype=float)
     n_models, n_samples = predictions.shape
     controls: list[np.ndarray] = []
+    rng = np.random.default_rng(seed)
 
     for _ in range(n_controls):
         if method == "label_shuffle":
             # Shuffle each model independently to break cross-model alignment
             ctrl = np.empty_like(predictions)
             for m in range(n_models):
-                ctrl[m] = predictions[m, np.random.permutation(n_samples)]
+                ctrl[m] = predictions[m, rng.permutation(n_samples)]
         elif method == "feature_shuffle":
-            # Shuffle each model independently against feature ordering
+            # Shuffle feature indices (shared permutation across models).
+            # This destroys the feature-prediction mapping while preserving
+            # inter-model correlation structure.
+            perm = rng.permutation(n_samples)
             ctrl = np.empty_like(predictions)
             for m in range(n_models):
-                ctrl[m] = predictions[m, np.random.permutation(n_samples)]
+                ctrl[m] = predictions[m, perm]
         elif method == "target_delay":
             # Apply different shifts per model
             ctrl = np.empty_like(predictions)
             for m in range(n_models):
-                shift = np.random.randint(1, max(2, n_samples // 2))
+                shift = rng.integers(1, max(2, n_samples // 2))
                 ctrl[m] = np.roll(predictions[m], shift)
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -151,6 +158,7 @@ def hsic_test(
     residuals_1: np.ndarray,
     residuals_2: np.ndarray,
     n_permutations: int = 1000,
+    seed: int = 42,
 ) -> tuple[float, float]:
     """HSIC independence test between two residual vectors.
 
@@ -162,6 +170,8 @@ def hsic_test(
     residuals_1 : array of shape (n,)
     residuals_2 : array of shape (n,)
     n_permutations : int
+    seed : int
+        Random seed for reproducibility.
 
     Returns
     -------
@@ -176,9 +186,10 @@ def hsic_test(
 
     hsic_observed = float(np.sum(Kx * Ky)) / (n * n)
 
+    rng = np.random.default_rng(seed)
     null_distribution = np.empty(n_permutations)
     for i in range(n_permutations):
-        perm = np.random.permutation(n)
+        perm = rng.permutation(n)
         Ky_perm = Ky[np.ix_(perm, perm)]
         null_distribution[i] = float(np.sum(Kx * Ky_perm)) / (n * n)
 

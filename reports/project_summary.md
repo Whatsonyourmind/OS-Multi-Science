@@ -1,9 +1,9 @@
 # OS Multi-Science: Project Summary and Academic Paper Outline
 
-**Version:** 2.0
+**Version:** 3.0
 **Date:** 2026-02-13
 **Author:** Luka Stanisljevic
-**Status:** ALL 8 Research Questions Complete -- State-of-the-Art Achieved
+**Status:** SOA v3.0 -- Peer-Review Ready with Real Data, Formal Proofs, and Baselines
 
 ---
 
@@ -22,7 +22,20 @@ All eight research questions (Q1-Q8) have been completed across three real-world
 7. **Q7 Meta-Learner**: Optimized weights improve composite objective over defaults; risk-coverage dominance confirmed
 8. **Q8 Tipping Detection**: Combined ABM+ML achieves F1=0.398 (highest); ICM minimum leads tipping by ~43 steps
 
-The codebase comprises 48 Python files (25,126 lines), 519 passing tests, three aggregation modes (logistic, geometric, calibrated Beta CDF), and full provenance tracking via an in-memory knowledge graph. Three real-world benchmarks validate practical applicability: 75-bank financial network, 500-node SEIR epidemic, and multi-wave COVID-19 simulation with vaccination effects.
+**v3.0 Additions (Peer-Review Hardening):**
+
+9. **Real Model Zoo**: 8 genuinely epistemically diverse model families (Logistic Regression, Decision Tree, Random Forest, Gradient Boosting, KNN, MLP, Naive Bayes, SVM) replacing noise-perturbation models
+10. **Real Datasets**: 6 public sklearn datasets (Iris, Wine, Breast Cancer, Digits, California Housing, Diabetes)
+11. **Standard Baselines**: Head-to-head comparison with ensemble averaging, stacking (LR/RF), bootstrap, split conformal prediction, and 5 diversity metrics
+12. **SOA Benchmark**: Comprehensive 5-experiment benchmark (prediction quality, uncertainty quantification, error detection, diversity assessment, score range analysis) on real data with real models
+13. **Mathematical Foundations**: 14 formal propositions/theorems with full proofs, 22 references
+14. **Critical Bug Fixes**: Agreement A (median→mean), Direction D (log(K) normalization), Ledoit-Wolf OAS formula, AUROC→informedness, negative control differentiation, seed propagation, input validation
+15. **ICM Score Range Fix**: logistic_scale/shift parameters and wide_range_preset() for functional CRC gating
+16. **Pi Component Activation**: compute_pi_from_predictions() auto-computes dependency penalty from residuals
+17. **Config Validation**: __post_init__ checks on weights, scale, and aggregation mode
+18. **Computational Complexity Analysis**: Full theoretical + empirical runtime analysis
+
+The codebase comprises 59 Python files (32,522 lines), 830 passing tests, four aggregation modes (logistic, geometric, calibrated Beta CDF, adaptive), and full provenance tracking via an in-memory knowledge graph. Six real-world benchmarks validate practical applicability: 75-bank financial network, 500-node SEIR epidemic, multi-wave COVID-19 simulation, and 6 real sklearn datasets with 8 diverse model families.
 
 ---
 

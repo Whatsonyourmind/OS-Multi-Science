@@ -15,6 +15,13 @@ class ICMConfig:
     w_C: float = 0.10  # Invariance weight
     lam: float = 0.15  # Dependency penalty coefficient
 
+    # Logistic sigmoid scaling parameters
+    # scale=1.0, shift=0.0 preserves legacy behavior (backward-compatible)
+    # Use wide_range_preset() for scale=10.0, shift=0.5 to spread scores
+    # across the full [0, 1] range.
+    logistic_scale: float = 1.0   # Scale factor for sigmoid input
+    logistic_shift: float = 0.0   # Center point for sigmoid
+
     # Dependency penalty sub-weights
     gamma_rho: float = 0.4   # Residual correlation weight
     gamma_J: float = 0.3     # Provenance overlap weight
@@ -37,6 +44,38 @@ class ICMConfig:
 
     # Adaptive aggregation calibration set (list of raw linear scores)
     adaptive_calibration_scores: list[float] | None = None
+
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        for name in ("w_A", "w_D", "w_U", "w_C", "lam"):
+            val = getattr(self, name)
+            if not 0.0 <= val <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {val}")
+        if self.logistic_scale <= 0:
+            raise ValueError(f"logistic_scale must be positive, got {self.logistic_scale}")
+        if self.aggregation not in ("logistic", "geometric", "calibrated", "adaptive"):
+            raise ValueError(f"Unknown aggregation mode: {self.aggregation!r}")
+
+    @classmethod
+    def wide_range_preset(cls, **overrides) -> "ICMConfig":
+        """Config preset with wide ICM score range.
+
+        Uses logistic_scale=10.0, logistic_shift=0.5 so that the logistic
+        sigmoid maps component combinations to nearly the full [0, 1] range
+        instead of the narrow ~[0.46, 0.70] band produced by the legacy
+        defaults (scale=1, shift=0).
+
+        With these settings:
+        - All components ~ 0 (total disagreement): ICM ~ 0.007
+        - All components ~ 1 (perfect agreement):  ICM ~ 0.97
+        - Mid-range components:                     ICM ~ 0.27
+
+        Any keyword argument accepted by ICMConfig can be passed as an
+        override.
+        """
+        defaults = dict(logistic_scale=10.0, logistic_shift=0.5)
+        defaults.update(overrides)
+        return cls(**defaults)
 
 
 @dataclass

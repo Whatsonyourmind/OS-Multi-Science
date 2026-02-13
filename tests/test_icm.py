@@ -23,6 +23,7 @@ from framework.icm import (
     compute_icm_calibrated,
     compute_icm_adaptive,
     _dispatch_aggregation,
+    compute_pi_from_predictions,
     compute_icm_from_predictions,
     compute_icm_timeseries,
 )
@@ -245,10 +246,12 @@ class TestComputeDirection:
         assert compute_direction(signs) == pytest.approx(1.0, abs=1e-6)
 
     def test_uniform_signs(self):
-        # Equal split: max entropy
+        # Equal split with K=4: H = log(2), H_max = log(K) = log(4)
+        # D = 1 - log(2)/log(4) = 0.5
         signs = np.array([1, -1, 1, -1])
         D = compute_direction(signs)
-        assert D == pytest.approx(0.0, abs=1e-6)
+        expected = 1.0 - np.log(2) / np.log(4)
+        assert D == pytest.approx(expected, abs=1e-6)
 
     def test_bounded_0_1(self):
         rng = np.random.default_rng(77)
@@ -936,10 +939,8 @@ class TestDispatchAggregation:
         assert result.icm_score == pytest.approx(direct.icm_score, abs=1e-12)
 
     def test_unknown_aggregation_raises(self):
-        config = ICMConfig(aggregation="unknown_method")
-        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.5)
         with pytest.raises(ValueError, match="Unknown aggregation"):
-            _dispatch_aggregation(comp, config)
+            ICMConfig(aggregation="unknown_method")
 
     def test_from_predictions_respects_config_aggregation(self):
         """compute_icm_from_predictions should use config.aggregation."""
@@ -1080,3 +1081,343 @@ class TestEdgeCases:
         z_norm = (z - z_min) / (z_max - z_min)
         result = compute_icm_calibrated(comp, config)
         assert result.icm_score == pytest.approx(z_norm, abs=1e-8)
+
+
+# ============================================================
+# Logistic scale/shift parameters
+# ============================================================
+
+class TestLogisticScaleShift:
+    """Tests for logistic_scale and logistic_shift config parameters."""
+
+    def test_default_scale_shift_preserves_legacy(self):
+        """Default scale=1, shift=0 gives identical results to legacy."""
+        from scipy.special import expit
+        comp = ICMComponents(A=0.8, D=0.7, U=0.6, C=0.9, Pi=0.2)
+        config = ICMConfig()
+        assert config.logistic_scale == 1.0
+        assert config.logistic_shift == 0.0
+        result = compute_icm(comp, config)
+        z_raw = (0.35 * 0.8 + 0.15 * 0.7 + 0.25 * 0.6 + 0.10 * 0.9
+                 - 0.15 * 0.2)
+        expected = float(expit(z_raw))
+        assert result.icm_score == pytest.approx(expected, abs=1e-12)
+
+    def test_scale_10_shift_05_perfect_convergence(self):
+        """With scale=10, shift=0.5, perfect components -> near 1.0."""
+        config = ICMConfig(logistic_scale=10.0, logistic_shift=0.5)
+        comp = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result = compute_icm(comp, config)
+        assert result.icm_score > 0.95
+
+    def test_scale_10_shift_05_no_convergence(self):
+        """With scale=10, shift=0.5, worst components -> near 0.0."""
+        config = ICMConfig(logistic_scale=10.0, logistic_shift=0.5)
+        comp = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result = compute_icm(comp, config)
+        assert result.icm_score < 0.05
+
+    def test_wide_range_preset_spreads_scores(self):
+        """wide_range_preset produces scores across the full [0, 1] range."""
+        config = ICMConfig.wide_range_preset()
+        assert config.logistic_scale == 10.0
+        assert config.logistic_shift == 0.5
+
+        rng = np.random.default_rng(42)
+        scores = []
+        for _ in range(200):
+            comp = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            scores.append(compute_icm(comp, config).icm_score)
+
+        score_range = max(scores) - min(scores)
+        assert score_range > 0.8, (
+            f"Wide range preset should cover >0.8 of [0,1], got {score_range:.4f}"
+        )
+
+    def test_wide_range_wider_than_legacy(self):
+        """Wide range preset produces wider spread than legacy defaults."""
+        rng = np.random.default_rng(42)
+        legacy_scores = []
+        wide_scores = []
+        config_legacy = ICMConfig()
+        config_wide = ICMConfig.wide_range_preset()
+        for _ in range(200):
+            comp = ICMComponents(
+                A=rng.uniform(), D=rng.uniform(),
+                U=rng.uniform(), C=rng.uniform(),
+                Pi=rng.uniform(),
+            )
+            legacy_scores.append(compute_icm(comp, config_legacy).icm_score)
+            wide_scores.append(compute_icm(comp, config_wide).icm_score)
+
+        legacy_std = float(np.std(legacy_scores))
+        wide_std = float(np.std(wide_scores))
+        assert wide_std > legacy_std, (
+            f"Wide std {wide_std:.4f} should exceed legacy std {legacy_std:.4f}"
+        )
+
+    def test_wide_range_preset_accepts_overrides(self):
+        """wide_range_preset can accept keyword overrides."""
+        config = ICMConfig.wide_range_preset(w_A=0.5, lam=0.20)
+        assert config.logistic_scale == 10.0
+        assert config.logistic_shift == 0.5
+        assert config.w_A == 0.5
+        assert config.lam == 0.20
+
+    def test_scale_preserves_monotonicity(self):
+        """Increasing components still increases score with scale/shift."""
+        config = ICMConfig(logistic_scale=10.0, logistic_shift=0.5)
+        scores = []
+        for level in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            comp = ICMComponents(A=level, D=level, U=level, C=level, Pi=0.0)
+            scores.append(compute_icm(comp, config).icm_score)
+        for i in range(1, len(scores)):
+            assert scores[i] >= scores[i - 1] - 1e-10
+
+    def test_scale_bounded_0_1(self):
+        """Scores remain in [0, 1] for any scale/shift."""
+        rng = np.random.default_rng(99)
+        for scale in [0.1, 1.0, 5.0, 10.0, 50.0]:
+            for shift in [-1.0, 0.0, 0.5, 1.0]:
+                config = ICMConfig(logistic_scale=scale, logistic_shift=shift)
+                for _ in range(20):
+                    comp = ICMComponents(
+                        A=rng.uniform(), D=rng.uniform(),
+                        U=rng.uniform(), C=rng.uniform(),
+                        Pi=rng.uniform(),
+                    )
+                    result = compute_icm(comp, config)
+                    assert 0.0 <= result.icm_score <= 1.0
+
+    def test_shift_only_moves_midpoint(self):
+        """Non-zero shift without scale change moves the sigmoid center."""
+        from scipy.special import expit
+        comp = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.0)
+
+        config_no_shift = ICMConfig(logistic_shift=0.0)
+        config_shifted = ICMConfig(logistic_shift=0.3)
+
+        r_no = compute_icm(comp, config_no_shift)
+        r_sh = compute_icm(comp, config_shifted)
+
+        # With shift=0.3, z = 1*(z_raw - 0.3), so sigmoid input is smaller
+        # -> lower score
+        assert r_sh.icm_score < r_no.icm_score
+
+
+# ============================================================
+# Pi from predictions
+# ============================================================
+
+class TestComputePiFromPredictions:
+    """Tests for compute_pi_from_predictions."""
+
+    def test_regression_independent_models(self):
+        """Independent regression models -> low Pi."""
+        rng = np.random.default_rng(42)
+        n = 500
+        y_true = rng.standard_normal(n)
+        predictions = {
+            "m1": y_true + rng.standard_normal(n) * 0.5,
+            "m2": y_true + rng.standard_normal(n) * 0.5,
+            "m3": y_true + rng.standard_normal(n) * 0.5,
+        }
+        Pi = compute_pi_from_predictions(predictions, y_true)
+        assert 0.0 <= Pi <= 1.0
+        assert Pi < 0.4  # Low correlation between independent residuals
+
+    def test_regression_clone_models(self):
+        """Identical regression models -> high Pi."""
+        rng = np.random.default_rng(42)
+        n = 500
+        y_true = rng.standard_normal(n)
+        pred = y_true + rng.standard_normal(n) * 0.3
+        predictions = {"m1": pred.copy(), "m2": pred.copy(), "m3": pred.copy()}
+        Pi = compute_pi_from_predictions(predictions, y_true)
+        assert Pi > 0.5  # High correlation: models are clones
+
+    def test_classification_probabilities(self):
+        """Classification with 2-D probability predictions."""
+        rng = np.random.default_rng(42)
+        n = 200
+        n_classes = 3
+        y_true = rng.integers(0, n_classes, size=n).astype(float)
+
+        # Build predictions with noise
+        predictions = {}
+        for i in range(3):
+            probs = rng.dirichlet(np.ones(n_classes), size=n)
+            predictions[f"m{i}"] = probs
+
+        Pi = compute_pi_from_predictions(predictions, y_true)
+        assert 0.0 <= Pi <= 1.0
+
+    def test_single_model_returns_zero(self):
+        """Single model should return Pi=0."""
+        y_true = np.array([1.0, 2.0, 3.0])
+        predictions = {"m1": np.array([1.1, 2.1, 3.1])}
+        Pi = compute_pi_from_predictions(predictions, y_true)
+        assert Pi == pytest.approx(0.0)
+
+    def test_bounded_0_1(self):
+        """Pi from predictions is always in [0, 1]."""
+        rng = np.random.default_rng(77)
+        for _ in range(30):
+            n = 100
+            y_true = rng.standard_normal(n)
+            predictions = {
+                f"m{i}": y_true + rng.standard_normal(n) * rng.uniform(0.1, 2.0)
+                for i in range(4)
+            }
+            Pi = compute_pi_from_predictions(predictions, y_true)
+            assert 0.0 <= Pi <= 1.0 + 1e-10
+
+
+# ============================================================
+# Auto Pi in compute_icm_from_predictions via y_true
+# ============================================================
+
+class TestAutoComputePi:
+    """Tests for automatic Pi computation via y_true in compute_icm_from_predictions."""
+
+    def test_y_true_triggers_nonzero_pi(self):
+        """Passing y_true should produce a non-trivial Pi (not 0)."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y_true = rng.standard_normal(n)
+        # Highly correlated models: clone predictions
+        base_pred = y_true + rng.standard_normal(n) * 0.1
+        predictions = {
+            "m1": base_pred + rng.normal(0, 0.01, n),
+            "m2": base_pred + rng.normal(0, 0.01, n),
+            "m3": base_pred + rng.normal(0, 0.01, n),
+        }
+
+        result_with_y = compute_icm_from_predictions(
+            predictions, y_true=y_true, distance_fn="wasserstein"
+        )
+        result_without_y = compute_icm_from_predictions(
+            predictions, distance_fn="wasserstein"
+        )
+
+        # Without y_true, Pi should be 0 (no residuals given)
+        assert result_without_y.components.Pi == pytest.approx(0.0)
+        # With y_true, Pi should be > 0 for correlated models
+        assert result_with_y.components.Pi > 0.0
+
+    def test_y_true_does_not_override_explicit_residuals(self):
+        """Explicit residuals take precedence over y_true."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y_true = rng.standard_normal(n)
+        predictions = {
+            "m1": y_true + rng.standard_normal(n) * 0.1,
+            "m2": y_true + rng.standard_normal(n) * 0.1,
+            "m3": y_true + rng.standard_normal(n) * 0.1,
+        }
+        # Provide explicit residuals that are highly correlated
+        # (not constant -- need non-zero variance for Ledoit-Wolf)
+        base_resid = rng.standard_normal(n)
+        residuals = np.vstack([
+            base_resid + rng.normal(0, 0.01, n),
+            base_resid + rng.normal(0, 0.01, n),
+            base_resid + rng.normal(0, 0.01, n),
+        ])
+
+        result = compute_icm_from_predictions(
+            predictions, y_true=y_true, residuals=residuals,
+            distance_fn="wasserstein",
+        )
+        # Pi should reflect the explicit residuals, not the auto-computed ones
+        assert result.components.Pi > 0.5
+
+    def test_without_y_true_backward_compatible(self):
+        """Without y_true, behavior is identical to before."""
+        p = np.array([0.25, 0.25, 0.25, 0.25])
+        preds = {f"m{i}": p for i in range(3)}
+        result = compute_icm_from_predictions(preds)
+        assert result.components.Pi == pytest.approx(0.0)
+        assert result.aggregation_method == "logistic"
+
+    def test_y_true_with_classification(self):
+        """Auto Pi computation works for classification outputs."""
+        rng = np.random.default_rng(42)
+        n = 200
+        n_classes = 4
+        y_true = rng.integers(0, n_classes, size=n).astype(float)
+
+        predictions = {}
+        for i in range(3):
+            probs = rng.dirichlet(np.ones(n_classes), size=n)
+            predictions[f"m{i}"] = probs
+
+        result = compute_icm_from_predictions(
+            predictions, y_true=y_true, distance_fn="hellinger"
+        )
+        assert 0.0 <= result.components.Pi <= 1.0
+        assert 0.0 <= result.icm_score <= 1.0
+
+
+# ============================================================
+# Combined scale/shift + Pi integration
+# ============================================================
+
+class TestScaleShiftPiIntegration:
+    """Integration tests combining wide range preset with auto Pi."""
+
+    def test_wide_range_with_y_true(self):
+        """Wide range preset + y_true gives well-separated scores."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y_true = rng.standard_normal(n)
+        config = ICMConfig.wide_range_preset()
+
+        # Agreeing independent models
+        agree_preds = {
+            f"m{i}": y_true + rng.standard_normal(n) * 0.05
+            for i in range(4)
+        }
+
+        # Disagreeing models with different biases
+        disagree_preds = {
+            "m0": y_true + 5.0 + rng.standard_normal(n),
+            "m1": y_true - 5.0 + rng.standard_normal(n),
+            "m2": -y_true + rng.standard_normal(n),
+            "m3": rng.standard_normal(n) * 10,
+        }
+
+        result_agree = compute_icm_from_predictions(
+            agree_preds, config=config, y_true=y_true,
+            distance_fn="wasserstein",
+        )
+        result_disagree = compute_icm_from_predictions(
+            disagree_preds, config=config, y_true=y_true,
+            distance_fn="wasserstein",
+        )
+
+        assert result_agree.icm_score > result_disagree.icm_score
+        # The gap should be substantial with wide range
+        gap = result_agree.icm_score - result_disagree.icm_score
+        assert gap > 0.1, f"Score gap {gap:.4f} too small for wide range preset"
+
+    def test_crc_thresholds_reachable_with_wide_range(self):
+        """With wide range preset, scores can cross tau_hi=0.7 and tau_lo=0.3."""
+        config = ICMConfig.wide_range_preset()
+
+        # High convergence case
+        high = ICMComponents(A=1.0, D=1.0, U=1.0, C=1.0, Pi=0.0)
+        result_hi = compute_icm(high, config)
+        assert result_hi.icm_score > 0.7, (
+            f"High convergence score {result_hi.icm_score:.4f} < 0.7"
+        )
+
+        # Low convergence case
+        low = ICMComponents(A=0.0, D=0.0, U=0.0, C=0.0, Pi=1.0)
+        result_lo = compute_icm(low, config)
+        assert result_lo.icm_score < 0.3, (
+            f"Low convergence score {result_lo.icm_score:.4f} > 0.3"
+        )
