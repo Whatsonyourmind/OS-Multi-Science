@@ -465,7 +465,7 @@ Dataset & Method & Coverage & Set Size & Cond. Cov. Std \\
 \end{tabular}
 \end{table}
 
-ICM-CRC gating achieves a mean coverage of 0.984 across all nine classification datasets under 5-fold CV, exceeding the nominal $1-\alpha = 0.90$ level (Table~\ref{tab:uq}). The average prediction set size is 1.40, indicating tight uncertainty quantification---on most samples, the CRC system identifies one or two classes with high confidence. The largest set sizes occur on Olivetti Faces (mean 2.22) and Circles (mean 1.63), reflecting the higher inherent uncertainty in those tasks. Split conformal prediction achieves comparable coverage with slightly smaller sets. The coverage advantage of ICM-CRC comes at the cost of marginally larger sets, reflecting its conservative approach to uncertainty.
+ICM-CRC gating achieves a mean coverage of 0.984 across all nine classification datasets under 5-fold CV, exceeding the nominal $1-\alpha = 0.90$ level (Table~\ref{tab:uq}). We note that this over-coverage (98.4\% at a 90\% target) indicates that the current CRC calibration is conservative: prediction sets are larger than strictly necessary to achieve the nominal level. This conservatism stems from using a single isotonic regression model across all samples; adaptive or class-conditional calibration could tighten the sets while maintaining valid coverage. The average prediction set size is 1.40---on most samples, the CRC system identifies one or two classes. The largest set sizes occur on Olivetti Faces (mean 2.22) and Circles (mean 1.63), reflecting higher inherent uncertainty. Split conformal prediction achieves coverage closer to the nominal level (mean 0.96) with slightly smaller sets (mean 1.01), demonstrating the coverage-efficiency trade-off between the two approaches.
 
 \subsection{Error Detection (Exp 3)}
 
@@ -660,7 +660,7 @@ ICM is most valuable in settings where:
 \end{itemize}
 
 \paragraph{Limitations.}
-We identify four key limitations:
+We identify six key limitations:
 
 \begin{enumerate}
     \item \textbf{Component weights are domain-dependent.} The default weights ($w_A = 0.35$, $w_D = 0.15$, $w_U = 0.25$, $w_C = 0.10$, $\lambda = 0.15$) were set based on domain knowledge, not learned from data. A sensitivity analysis shows that perturbing any weight by $\pm 50\%$ changes the mean ICM score by 0.07--0.23 across datasets, with normalized sensitivities in the range 0.5--1.5 for all four positive components---indicating that no single component dominates disproportionately and the weight vector is reasonably balanced. Our meta-learner framework can optimize these weights, but optimal weights may differ across application domains.
@@ -669,8 +669,15 @@ We identify four key limitations:
 
     \item \textbf{Dependency penalty activation.} In our primary benchmarks, $\Pi = 0$ because the model zoo uses independent families without providing residual information. Experiment~7 demonstrates that when residual correlations are provided, $\Pi$ activates meaningfully ($\Pi \approx 0.52$ for diverse models, $\Pi \approx 0.63$ for correlated ensembles). Full activation with gradient attributions and feature provenance metadata, available in production settings, would provide even stronger dependency detection.
 
+    \item \textbf{Invariance component near-constant.} The perturbation invariance $C$ shows low variance across datasets (0.903--0.932), indicating it provides limited discriminative signal in our benchmark. This is because all models in our zoo produce stable predictions under small input perturbations on tabular data. In domains with adversarially sensitive models or high-dimensional inputs (e.g., images, text), we expect $C$ to vary more meaningfully and contribute greater diagnostic value.
+
+    \item \textbf{Conservative coverage.} The ICM-CRC system achieves 98.4\% coverage at a nominal 90\% target, indicating over-conservative prediction sets. This results from using a single isotonic calibration model. Adaptive or class-conditional calibration could tighten sets closer to the nominal level without sacrificing the coverage guarantee.
+
     \item \textbf{Marginal vs.\ conditional coverage.} The CRC coverage guarantee is marginal, not conditional~\citep{barber2021limits}. For specific subpopulations, the actual coverage may deviate from the nominal level.
 \end{enumerate}
+
+\paragraph{Relationship to Bayesian model averaging.}
+ICM and BMA~\citep{hoeting1999bayesian} serve different purposes. BMA weights models by posterior probability to optimize predictive accuracy, requiring a likelihood specification. ICM diagnoses the \emph{nature} of agreement by decomposing geometric properties of model outputs, requiring no likelihood. The two are complementary: BMA could serve as the aggregation method while ICM provides the diagnostic layer that reveals \emph{why} the posterior concentrates on certain models. We do not include BMA as a prediction baseline because ICM is not designed to compete on raw accuracy; rather, it augments any aggregation method with interpretable convergence diagnostics.
 
 \paragraph{Computational cost.}
 The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ for Hellinger with $C$ classes) and the Ledoit-Wolf correlation ($O(K^2 N)$). For typical settings ($K = 3$--$8$, $C \leq 40$, $N \leq 10^4$), the total runtime is under one second on commodity hardware. The full benchmark suite (11 datasets, 8 models plus deep ensemble, 8 experiments) completes in approximately 140 seconds.
