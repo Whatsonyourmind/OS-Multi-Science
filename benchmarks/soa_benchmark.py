@@ -40,6 +40,7 @@ from benchmarks.baselines import (
     BootstrapEnsemble,
     SplitConformal,
     DiversityMetrics,
+    DeepEnsemble,
     _mean_proba,
     _extract_class_predictions,
     _compute_standard_scores,
@@ -296,9 +297,10 @@ def _compute_per_sample_icm_classification(
     ICM is computed WITHOUT test labels to avoid circularity.  Only
     unsupervised components are used:
     - A (agreement): pairwise Hellinger distance between model predictions
-    - D (direction): direction agreement across models
+    - D (direction): argmax class-vote agreement (if config.direction_mode
+      is "auto" or "argmax"), or 1.0 for legacy sign mode
     - U (uncertainty overlap): overlap of per-model prediction intervals
-    - C (invariance): set to 1.0 (no perturbation)
+    - C (invariance): perturbation-based if config.perturbation_scale > 0
     - Pi (dependency): set to 0.0 (no test labels available)
 
     Returns
@@ -312,6 +314,50 @@ def _compute_per_sample_icm_classification(
     n_samples = pred_arrays[0].shape[0]
     K = len(model_names)
 
+    # Pre-compute adaptive C_A if needed (across ALL samples for stability)
+    use_adaptive_C_A = config.C_A_mode == "adaptive"
+    if use_adaptive_C_A:
+        # Compute global pairwise distance distribution for C_A calibration
+        all_dists = []
+        # Sample up to 200 samples for efficiency
+        sample_indices = np.random.default_rng(0).choice(
+            n_samples, size=min(200, n_samples), replace=False,
+        )
+        for idx in sample_indices:
+            for ki in range(K):
+                for kj in range(ki + 1, K):
+                    p = np.maximum(pred_arrays[ki][idx], 0.0)
+                    q = np.maximum(pred_arrays[kj][idx], 0.0)
+                    h = float(np.sqrt(0.5 * np.sum((np.sqrt(p) - np.sqrt(q)) ** 2)))
+                    all_dists.append(h)
+        C_A_adaptive = float(np.percentile(all_dists, config.C_A_adaptive_percentile)) * 1.1 + 1e-12
+    else:
+        C_A_adaptive = config.C_A_hellinger
+
+    # Pre-compute D: direction agreement (same for all samples in argmax mode,
+    # but we compute per-sample for accuracy)
+    use_argmax_direction = (
+        config.direction_mode == "argmax"
+        or (config.direction_mode == "auto" and pred_arrays[0].ndim == 2 and pred_arrays[0].shape[1] > 1)
+    )
+    if use_argmax_direction:
+        argmax_per_model = np.stack([np.argmax(p, axis=1) for p in pred_arrays])  # (K, n_samples)
+
+    # Pre-compute C: invariance via perturbation
+    if config.perturbation_scale > 0.0:
+        rng = np.random.default_rng(0)
+        pre_all = []
+        post_all = []
+        for p_arr in pred_arrays:
+            p_flat = p_arr.ravel()
+            p_std = float(np.std(p_flat)) + 1e-12
+            noise = rng.normal(0, config.perturbation_scale * p_std, size=p_flat.shape)
+            pre_all.extend(p_flat.tolist())
+            post_all.extend((p_flat + noise).tolist())
+        C_global = compute_invariance(np.array(pre_all), np.array(post_all))
+    else:
+        C_global = 1.0
+
     icm_scores = np.empty(n_samples, dtype=np.float64)
 
     for i in range(n_samples):
@@ -321,16 +367,26 @@ def _compute_per_sample_icm_classification(
             for kj in range(ki + 1, K):
                 p = pred_arrays[ki][i]
                 q = pred_arrays[kj][i]
-                # Hellinger: clip negatives for safety
                 p_safe = np.maximum(p, 0.0)
                 q_safe = np.maximum(q, 0.0)
                 h = float(np.sqrt(0.5 * np.sum((np.sqrt(p_safe) - np.sqrt(q_safe)) ** 2)))
                 dists.append(h)
         mean_d = float(np.mean(dists)) if dists else 0.0
-        A = max(1.0 - mean_d / config.C_A_hellinger, 0.0)
+        A = max(1.0 - mean_d / C_A_adaptive, 0.0)
 
-        # D: direction -- all models predict positive, so D = 1.0
-        D = 1.0
+        # D: direction
+        if use_argmax_direction:
+            votes = argmax_per_model[:, i]
+            unique, counts = np.unique(votes, return_counts=True)
+            if len(unique) <= 1:
+                D = 1.0
+            else:
+                probs = counts / counts.sum()
+                H = -float(np.sum(probs * np.log(probs + 1e-12)))
+                H_max = float(np.log(len(unique)))
+                D = 1.0 - H / H_max if H_max > 1e-12 else 1.0
+        else:
+            D = 1.0  # Legacy sign mode: all probabilities are positive
 
         # U: uncertainty overlap from per-model confidence intervals
         intervals = []
@@ -341,8 +397,8 @@ def _compute_per_sample_icm_classification(
             intervals.append((lo, hi))
         U = compute_uncertainty_overlap(intervals)
 
-        # C: invariance -- no perturbation, stable
-        C_val = 1.0
+        # C: invariance (global, not per-sample)
+        C_val = C_global
 
         # Pi: set to 0 -- no test labels used (avoids circularity)
         Pi = 0.0
@@ -517,6 +573,21 @@ def experiment_prediction_quality(
             "log_loss": ea_scores["log_loss"],
             "brier_score": ea_scores["brier_score"],
         })
+
+        # Deep Ensemble (5 MLP members with different architectures)
+        try:
+            de = DeepEnsemble(n_members=5, max_iter=200, seed=seed)
+            de.fit(X_train, y_train)
+            de_scores = de.score(X_test, y_test)
+            de_scores["method"] = "Deep Ensemble"
+            results_rows.append(de_scores)
+        except Exception:
+            results_rows.append({
+                "method": "Deep Ensemble",
+                "accuracy": np.nan,
+                "log_loss": np.nan,
+                "brier_score": np.nan,
+            })
 
         return {
             "results_table": pd.DataFrame(results_rows),

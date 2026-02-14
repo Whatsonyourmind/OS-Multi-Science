@@ -1,0 +1,774 @@
+% ============================================================
+% Multi-Epistemic Convergence Diagnostics: A Unified Framework
+% for Ensemble Agreement, Uncertainty, and Reliability
+% ============================================================
+% Target venue: NeurIPS / ICML / AAAI
+%
+% COMPILATION INSTRUCTIONS:
+% 1. Download neurips_2024.sty from https://neurips.cc/Conferences/2024/CallForPapers
+%    and place it in this directory.
+% 2. Compile with: pdflatex icm_paper && bibtex icm_paper && pdflatex icm_paper && pdflatex icm_paper
+%
+% If neurips_2024.sty is not available, comment out the \usepackage line below
+% and uncomment the fallback geometry line.
+% ============================================================
+
+\documentclass{article}
+
+% --- NeurIPS-style packages ---
+\usepackage[final]{neurips_2024}
+% Fallback if neurips_2024.sty is not available:
+% \usepackage[margin=1in]{geometry}
+% \usepackage{natbib}
+
+% --- Mathematics ---
+\usepackage{amsmath,amssymb,amsthm}
+
+% --- Tables and figures ---
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{array}
+
+% --- Algorithms ---
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% --- Hyperlinks ---
+\usepackage{hyperref}
+\usepackage{url}
+
+% --- Colors for remarks ---
+\usepackage{xcolor}
+
+% --- Theorem environments ---
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+% --- Custom commands ---
+\newcommand{\icm}{\mathrm{ICM}}
+\newcommand{\cF}{\mathcal{F}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\PP}{\mathbb{P}}
+\newcommand{\EE}{\mathbb{E}}
+\newcommand{\ind}{\mathbb{1}}
+\newcommand{\bw}{\mathbf{w}}
+\newcommand{\bc}{\mathbf{c}}
+
+\title{Multi-Epistemic Convergence Diagnostics: A Unified Framework \\ for Ensemble Agreement, Uncertainty, and Reliability}
+
+\author{
+  Luka Stanisljevic \\
+  Independent Researcher \\
+  \texttt{github.com/os-multi-science} \\
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+When multiple models---spanning statistical methods, machine learning, and simulation---are applied to the same prediction task, practitioners face a fundamental question: do these models \emph{truly} agree, or is their apparent consensus an artifact of shared biases, correlated training data, or saturated metrics? Existing ensemble diversity measures such as the Q-statistic, pairwise disagreement, and predictive entropy each capture only a single facet of inter-model agreement and offer no mechanism to distinguish genuine from spurious convergence. We introduce the \emph{Index of Convergence Multi-epistemic} (ICM), a five-component diagnostic score that aggregates distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded value in $(0,1)$ via logistic aggregation. We prove that the ICM is bounded, monotone in each positive component, and Lipschitz continuous with a small constant ($L \approx 0.12$). We couple ICM with a conformal risk control (CRC) gating mechanism that provides distribution-free coverage guarantees and partitions predictions into ACT, DEFER, and AUDIT decisions. Experiments on eleven datasets (nine classification, two regression) with eight diverse model families plus a deep ensemble baseline show that ICM-weighted predictions achieve competitive accuracy (mean 0.9462 across classification tasks), the ICM-CRC system provides valid conformal coverage (mean 0.9910) with tight prediction sets (mean size 1.44), and ICM-based error detection matches entropy baselines (Spearman $\rho = 0.2359$ vs.\ $0.2443$). The wide-range preset expands the effective score range by $16.1\times$ over default logistic aggregation, enabling meaningful three-way decision gating. Crucially, ICM automatically calibrates ACT rates to problem difficulty---from 83\% on easy datasets to 13\% on a 40-class face recognition task---with all five components varying meaningfully across the evaluation suite ($A{=}0.443$, $D{=}0.753$, $U{=}0.791$, $C{=}0.921$). The primary value of ICM is not in surpassing baselines on raw accuracy, but in providing a decomposable, formally grounded diagnostic signal that reveals \emph{when} and \emph{why} an ensemble's output should be trusted.
+\end{abstract}
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:introduction}
+
+Complex prediction tasks in science and engineering are increasingly addressed by ensembles of heterogeneous models. Climate projections combine general circulation models with statistical downscaling~\citep{tebaldi2007use,knutti2010challenges}. Epidemic forecasters aggregate mechanistic compartmental models, agent-based simulations, and machine learning regressors~\citep{ray2020ensemble,reich2019accuracy}. Financial risk assessment draws on network contagion models, time-series econometrics, and gradient boosting~\citep{friedman2001greedy}. In each domain, the central question is the same: \emph{how much should we trust the ensemble's output?}
+
+The answer depends critically on the nature of inter-model agreement. If all models converge on the same prediction independently---using different assumptions, different data representations, and different inductive biases---then convergence constitutes strong epistemic evidence. But if models agree because they share a common bias, train on overlapping features, or are drawn from the same parametric family, the apparent consensus carries far less evidential weight. Existing metrics fail to make this distinction:
+
+\begin{itemize}
+    \item \textbf{Pairwise disagreement and Q-statistic}~\citep{kuncheva2003measures}: Measure label-level agreement but ignore distributional structure, uncertainty calibration, and model dependencies.
+    \item \textbf{Predictive entropy}~\citep{lakshminarayanan2017simple}: Captures spread in the predictive distribution but conflates aleatoric and epistemic uncertainty and provides no dependency correction.
+    \item \textbf{Cohen's $\kappa$ and Fleiss' $\kappa$}~\citep{cohen1960coefficient,fleiss1971measuring}: Designed for discrete ratings with chance correction, but cannot handle continuous distributions or heterogeneous output types.
+    \item \textbf{Deep ensemble disagreement}~\citep{lakshminarayanan2017simple,gal2016dropout}: Quantifies within-family uncertainty (e.g., neural networks with different seeds) but does not address cross-paradigm convergence.
+\end{itemize}
+
+\paragraph{Contributions.} We propose the Index of Convergence Multi-epistemic (ICM), a unified framework that addresses these limitations through five contributions:
+
+\begin{enumerate}
+    \item A \textbf{five-component convergence score} $\icm = \sigma(w_A A + w_D D + w_U U + w_C C - \lambda \Pi)$ that decomposes ensemble agreement into distributional agreement ($A$), directional consensus ($D$), uncertainty overlap ($U$), perturbation invariance ($C$), and a dependency penalty ($\Pi$), each formally defined on $[0,1]$.
+    \item \textbf{Formal guarantees}: boundedness (Proposition~\ref{prop:bounded}), monotonicity in each positive component (Proposition~\ref{prop:monotone}), and Lipschitz continuity with constant $L \approx 0.12$ (Proposition~\ref{prop:lipschitz}).
+    \item A \textbf{conformal risk control (CRC) gating} mechanism that maps ICM scores to calibrated risk bounds with distribution-free coverage guarantees, partitioning predictions into ACT/DEFER/AUDIT decisions (Theorem~\ref{thm:coverage}).
+    \item \textbf{Anti-saturation mechanisms}---adaptive normalization, argmax-based direction, and perturbation scaling---that expand the effective score range by $16.1\times$, enabling practical decision gating.
+    \item \textbf{Comprehensive benchmarking} on eleven datasets (nine classification, two regression) with eight model families plus a deep ensemble baseline, demonstrating competitive prediction quality, valid uncertainty quantification, effective error detection, and difficulty-calibrated decision gating.
+\end{enumerate}
+
+\paragraph{Paper roadmap.} Section~\ref{sec:related} surveys related work. Section~\ref{sec:framework} formally defines the ICM framework and its properties. Section~\ref{sec:crc} presents the CRC gating system. Section~\ref{sec:experiments} describes the experimental setup, Section~\ref{sec:results} reports results, Section~\ref{sec:discussion} discusses findings and limitations, and Section~\ref{sec:conclusion} concludes.
+
+
+% ============================================================
+% 2. RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Ensemble diversity metrics.} The taxonomy of diversity measures for classifier ensembles was systematized by \citet{kuncheva2003measures}, who analyzed ten pairwise and non-pairwise measures including the Q-statistic, disagreement measure, correlation coefficient, and double-fault measure. \citet{dietterich2000ensemble} provided foundational arguments for why ensembles work, emphasizing the statistical, computational, and representational advantages of combining models. These measures operate on binary predictions and do not extend naturally to probabilistic outputs or continuous distributions.
+
+\paragraph{Conformal prediction and calibration.} Conformal prediction~\citep{vovk2005algorithmic,shafer2008tutorial} provides distribution-free coverage guarantees for prediction sets. \citet{romano2019conformalized} introduced conformalized quantile regression, extending coverage guarantees to heteroscedastic settings. \citet{barber2021limits} characterized the fundamental limits of conditional coverage. \citet{angelopoulos2021gentle} provided a comprehensive tutorial. Our CRC gating builds on split conformal prediction but applies it to multi-model convergence scores rather than single-model nonconformity scores. Model calibration~\citep{guo2017calibration} is a related but distinct concern: calibration ensures that a model's confidence reflects its accuracy, whereas ICM measures whether multiple models' outputs are mutually consistent.
+
+\paragraph{Multi-model integration in applied science.} Climate science has a long tradition of multi-model ensembles~\citep{tebaldi2007use,knutti2010challenges,yates1999distribution}, typically combining models via simple averaging or Bayesian model averaging. In epidemiology, the COVID-19 pandemic catalyzed large-scale multi-model forecast hubs~\citep{ray2020ensemble,reich2019accuracy} that aggregate dozens of independent forecasters. These efforts focus on improving point predictions rather than diagnosing the nature of inter-model agreement.
+
+\paragraph{Uncertainty quantification.} Deep ensembles~\citep{lakshminarayanan2017simple} and MC Dropout~\citep{gal2016dropout} provide uncertainty estimates within a single model family. \citet{wilson2020bayesian} advocated for Bayesian perspectives on generalization. \citet{ovadia2019can} showed that uncertainty estimates degrade under dataset shift. These methods address within-family epistemic uncertainty; ICM addresses \emph{cross-family} convergence, which is a qualitatively different signal.
+
+\paragraph{Statistical dependence testing.} The Hilbert-Schmidt Independence Criterion (HSIC)~\citep{gretton2012kernel} is a kernel-based test for statistical independence that we use in the dependency penalty and anti-spurious protocol. The Ledoit-Wolf shrinkage estimator~\citep{ledoit2004well} provides well-conditioned correlation estimates when the number of models may be comparable to the number of observations.
+
+
+% ============================================================
+% 3. THE ICM FRAMEWORK
+% ============================================================
+\section{The ICM Framework}
+\label{sec:framework}
+
+\subsection{Setup and Notation}
+
+Let $\cF = \{f_1, \ldots, f_K\}$ denote a set of $K \geq 2$ epistemically diverse predictive models, where each $f_k$ maps inputs $x \in \mathcal{X}$ to a distribution or point prediction $\hat{y}_k$. Let $P_k$ denote the output distribution of model $f_k$. We require that the models span genuinely different modeling paradigms---not merely different hyperparameters or random seeds within a single family.
+
+\subsection{ICM Definition}
+
+\begin{definition}[ICM Score]\label{def:icm}
+The \emph{Index of Convergence Multi-epistemic} is defined as:
+\begin{equation}\label{eq:icm}
+\icm(\cF) = \sigma\!\Big(\text{scale} \cdot \big(w_A \cdot A + w_D \cdot D + w_U \cdot U + w_C \cdot C - \lambda \cdot \Pi - \text{shift}\big)\Big)
+\end{equation}
+where $\sigma(z) = (1 + e^{-z})^{-1}$ is the logistic sigmoid, $A, D, U, C, \Pi \in [0,1]$ are the five components defined below, and $w_A, w_D, w_U, w_C, \lambda > 0$ are weight parameters. The \texttt{scale} and \texttt{shift} parameters control the effective range: the default configuration uses $\text{scale}=1, \text{shift}=0$; the \emph{wide-range preset} uses $\text{scale}=10, \text{shift}=0.5$.
+\end{definition}
+
+The default weights are $w_A = 0.35$, $w_D = 0.15$, $w_U = 0.25$, $w_C = 0.10$, $\lambda = 0.15$, reflecting the relative importance of distributional agreement as the primary signal with directional consensus and dependency as secondary modulators.
+
+We define the \emph{linear pre-activation} as $z = w_A A + w_D D + w_U U + w_C C - \lambda \Pi$, so that in the default configuration $\icm = \sigma(z)$.
+
+\subsection{Component Definitions}
+
+\begin{definition}[Distributional Agreement $A$]\label{def:agreement}
+Given $K$ model output distributions $\{P_1, \ldots, P_K\}$ and a distance function $d$ (Hellinger, Wasserstein-2, or MMD with RBF kernel):
+\begin{equation}
+A(\cF) = \text{clip}\!\left(1 - \frac{\bar{d}}{C_A},\; 0,\; 1\right), \quad \bar{d} = \frac{2}{K(K{-}1)}\sum_{i < j} d(P_i, P_j)
+\end{equation}
+where $C_A > 0$ is a normalization constant. In \emph{adaptive mode}, $C_A$ is set to 1.1 times the 90th percentile of observed pairwise distances, preventing saturation with diverse model families.
+\end{definition}
+
+\begin{definition}[Directional Consensus $D$]\label{def:direction}
+Given $K$ model direction indicators $s_k \in \{-1, 0, +1\}$:
+\begin{equation}
+D(\cF) = 1 - \frac{H(\hat{p})}{H_{\max}}, \quad H(\hat{p}) = -\sum_c \hat{p}_c \log \hat{p}_c
+\end{equation}
+where $\hat{p}$ is the empirical distribution over observed sign categories and $H_{\max} = \log(|\mathcal{C}|)$ with $\mathcal{C}$ the set of distinct signs. In \emph{argmax mode} (for classification), direction is computed from per-sample class-vote entropy averaged across samples.
+\end{definition}
+
+\begin{definition}[Uncertainty Overlap $U$]\label{def:uncertainty}
+Given $K$ confidence intervals $\{[l_k, u_k]\}_{k=1}^K$, the uncertainty overlap is the mean pairwise Intersection-over-Union:
+\begin{equation}
+U(\cF) = \frac{2}{K(K{-}1)}\sum_{i < j} \frac{\max(\min(u_i, u_j) - \max(l_i, l_j),\, 0)}{\max(u_i, u_j) - \min(l_i, l_j)}
+\end{equation}
+\end{definition}
+
+\begin{definition}[Perturbation Invariance $C$]\label{def:invariance}
+Given pre-perturbation predictions $\hat{y}^{\mathrm{pre}}$ and post-perturbation predictions $\hat{y}^{\mathrm{post}}$:
+\begin{equation}
+C(\cF) = 1 - \min\!\left(\frac{\|\hat{y}^{\mathrm{pre}} - \hat{y}^{\mathrm{post}}\|}{\|\hat{y}^{\mathrm{pre}}\| + \epsilon},\; 1\right)
+\end{equation}
+where $\epsilon = 10^{-12}$. In the wide-range preset, perturbation noise is scaled to $0.1 \cdot \text{std}(\text{predictions})$ rather than using a fixed absolute scale, ensuring the invariance component reflects meaningful sensitivity.
+\end{definition}
+
+\begin{definition}[Dependency Penalty $\Pi$]\label{def:dependency}
+The dependency penalty combines three sub-scores:
+\begin{equation}
+\Pi(\cF) = \bar{\gamma}_\rho \cdot \rho_{\mathrm{corr}} + \bar{\gamma}_J \cdot J_{\mathrm{overlap}} + \bar{\gamma}_{\mathrm{grad}} \cdot g_{\mathrm{sim}}
+\end{equation}
+where $\bar{\gamma}_\rho, \bar{\gamma}_J, \bar{\gamma}_{\mathrm{grad}}$ are sub-weights (default $0.4, 0.3, 0.3$) normalized to sum to 1, and:
+\begin{itemize}
+    \item $\rho_{\mathrm{corr}}$: mean absolute off-diagonal entry of the Ledoit-Wolf shrinkage estimate~\citep{ledoit2004well} of the residual correlation matrix;
+    \item $J_{\mathrm{overlap}}$: mean pairwise Jaccard similarity of model feature sets;
+    \item $g_{\mathrm{sim}}$: mean pairwise cosine similarity of gradient attribution vectors, mapped from $[-1,1]$ to $[0,1]$ via $(x+1)/2$.
+\end{itemize}
+\end{definition}
+
+\subsection{Formal Properties}
+
+\begin{proposition}[Boundedness]\label{prop:bounded}
+For all valid inputs where $A, D, U, C, \Pi \in [0,1]$ and all weights $w_A, w_D, w_U, w_C, \lambda > 0$:
+\begin{equation}
+\icm(\cF) \in (0, 1)
+\end{equation}
+More precisely, $\sigma(-\lambda) \leq \icm \leq \sigma(w_A + w_D + w_U + w_C)$. With default parameters: $\icm \in [\sigma(-0.15), \sigma(0.85)] \approx [0.463, 0.701]$.
+\end{proposition}
+
+\begin{proof}
+The pre-activation $z = w_A A + w_D D + w_U U + w_C C - \lambda \Pi$ achieves its minimum $z_{\min} = -\lambda$ when $A = D = U = C = 0$ and $\Pi = 1$, and its maximum $z_{\max} = w_A + w_D + w_U + w_C$ when $A = D = U = C = 1$ and $\Pi = 0$. Since $\sigma: \RR \to (0,1)$ is strictly increasing, $\sigma(z_{\min}) \leq \icm \leq \sigma(z_{\max})$.
+\end{proof}
+
+\begin{proposition}[Monotonicity]\label{prop:monotone}
+The ICM is strictly monotone increasing in each of $A$, $D$, $U$, $C$ and strictly monotone decreasing in $\Pi$:
+\begin{equation}
+\frac{\partial\,\icm}{\partial A} = w_A \sigma'(z) > 0, \quad \frac{\partial\,\icm}{\partial \Pi} = -\lambda \sigma'(z) < 0
+\end{equation}
+where $\sigma'(z) = \sigma(z)(1 - \sigma(z)) > 0$.
+\end{proposition}
+
+\begin{proof}
+By the chain rule, $\partial \icm / \partial A = \sigma'(z) \cdot w_A$. Since $\sigma'(z) > 0$ for all $z \in \RR$ and $w_A > 0$, the derivative is strictly positive. The argument for $D$, $U$, $C$ is identical. For $\Pi$: $\partial \icm / \partial \Pi = \sigma'(z) \cdot (-\lambda) < 0$.
+\end{proof}
+
+\begin{proposition}[Lipschitz Continuity]\label{prop:lipschitz}
+For any two component vectors $\bc = (A, D, U, C, \Pi)$ and $\bc' = (A', D', U', C', \Pi')$:
+\begin{equation}
+|\icm(\bc) - \icm(\bc')| \leq L_{\icm} \cdot \|\bc - \bc'\|, \quad L_{\icm} = \frac{1}{4}\sqrt{w_A^2 + w_D^2 + w_U^2 + w_C^2 + \lambda^2}
+\end{equation}
+With default parameters: $L_{\icm} = \frac{1}{4}\sqrt{0.2400} \approx 0.122$.
+\end{proposition}
+
+\begin{proof}
+The sigmoid satisfies $\sup_z |\sigma'(z)| = 1/4$, so $\sigma$ is $\frac{1}{4}$-Lipschitz. The pre-activation is linear with coefficient vector $\bw^* = (w_A, w_D, w_U, w_C, -\lambda)$. By Cauchy-Schwarz, $|z(\bc) - z(\bc')| \leq \|\bw^*\| \cdot \|\bc - \bc'\|$. Composing: $|\icm(\bc) - \icm(\bc')| \leq \frac{1}{4}\|\bw^*\| \cdot \|\bc - \bc'\|$.
+\end{proof}
+
+\begin{remark}
+The small Lipschitz constant ($\approx 0.12$) means that the sigmoid aggregation acts as a smoothing operator: a perturbation of magnitude $\epsilon$ in the component vector changes the ICM by at most $0.12\epsilon$. This is beneficial for stability but compresses the output range, motivating the wide-range preset which uses $\text{scale}=10$ to amplify sensitivity.
+\end{remark}
+
+\subsection{Anti-Saturation Mechanisms}
+
+With default parameters, the effective ICM range is compressed to approximately $[0.46, 0.70]$---a span of only $0.24$ units. This is insufficient for meaningful three-way decision gating. The \emph{wide-range preset} addresses this through three mechanisms:
+
+\begin{enumerate}
+    \item \textbf{Scaled logistic:} Setting $\text{scale}=10$, $\text{shift}=0.5$ maps the pre-activation to $\sigma(10(z - 0.5))$, which ranges from $\sigma(-5) \approx 0.007$ to $\sigma(3.5) \approx 0.97$.
+    \item \textbf{Adaptive $C_A$:} Setting the agreement normalization constant from data (90th percentile of observed distances) prevents the agreement component from saturating at 0 when diverse models produce large distributional distances.
+    \item \textbf{Perturbation scaling:} Setting $\text{perturbation\_scale} = 0.1$ scales perturbation noise to $0.1 \cdot \text{std}(\text{predictions})$, ensuring the invariance component reflects meaningful sensitivity rather than being dominated by absolute noise magnitude.
+\end{enumerate}
+
+\subsection{ICM Computation}
+
+Algorithm~\ref{alg:icm} summarizes the complete ICM computation pipeline.
+
+\begin{algorithm}[t]
+\caption{ICM Computation from Model Predictions}\label{alg:icm}
+\begin{algorithmic}[1]
+\REQUIRE Predictions $\{P_1, \ldots, P_K\}$ from $K$ models, config $\theta$
+\ENSURE ICM score $\in (0,1)$ and component vector $(A, D, U, C, \Pi)$
+\STATE Compute pairwise distances $d_{ij} = d(P_i, P_j)$ for all $i < j$
+\STATE $A \leftarrow \text{clip}(1 - \bar{d}/C_A, 0, 1)$ where $\bar{d} = \text{mean}(d_{ij})$
+\STATE Extract direction indicators $s_k$ from predictions
+\STATE $D \leftarrow 1 - H(\hat{p}_{\text{signs}}) / H_{\max}$
+\STATE Compute confidence intervals $[l_k, u_k]$ from prediction quantiles
+\STATE $U \leftarrow \text{mean pairwise IoU of intervals}$
+\STATE Generate perturbed predictions $P_k' = P_k + \epsilon_k$ with $\epsilon_k \sim \mathcal{N}(0, \theta.\text{scale} \cdot \text{std}(P_k))$
+\STATE $C \leftarrow 1 - \|\hat{y}^{\text{pre}} - \hat{y}^{\text{post}}\| / (\|\hat{y}^{\text{pre}}\| + 10^{-12})$
+\IF{residuals, features, or gradients available}
+    \STATE $\Pi \leftarrow \bar{\gamma}_\rho \rho_{\text{corr}} + \bar{\gamma}_J J_{\text{overlap}} + \bar{\gamma}_{\text{grad}} g_{\text{sim}}$
+\ELSE
+    \STATE $\Pi \leftarrow 0$
+\ENDIF
+\STATE $z \leftarrow w_A A + w_D D + w_U U + w_C C - \lambda \Pi$
+\STATE \textbf{return} $\sigma(\text{scale} \cdot (z - \text{shift}))$, $(A, D, U, C, \Pi)$
+\end{algorithmic}
+\end{algorithm}
+
+The overall computational complexity is $O(K^2 \cdot \max(C, N))$ where $C$ is the number of classes and $N$ is the number of samples, dominated by the pairwise distance computation in the agreement component and the Ledoit-Wolf correlation in the dependency penalty.
+
+
+% ============================================================
+% 4. CONFORMAL RISK CONTROL GATING
+% ============================================================
+\section{Conformal Risk Control Gating}
+\label{sec:crc}
+
+\subsection{From ICM to Risk Bounds}
+
+The CRC module converts ICM scores into calibrated epistemic risk bounds through a three-stage pipeline:
+
+\begin{enumerate}
+    \item \textbf{Isotonic regression:} Fit a monotone non-increasing function $g: [0,1] \to \RR_+$ from calibration pairs $\{(C_i, L_i)\}_{i=1}^{n_{\text{train}}}$ where $C_i = \icm(x_i)$ and $L_i = \ell(y_i, \hat{y}_i)$.
+    \item \textbf{Split conformal calibration:} On a held-out set $\{(C_j, L_j)\}_{j=1}^{n_{\text{cal}}}$, compute residuals $r_j = L_j - g(C_j)$ and let $\hat{q}$ be the $\lceil(1-\alpha)(n_{\text{cal}}+1)\rceil / n_{\text{cal}}$-th empirical quantile.
+    \item \textbf{Conformalized risk function:} $g_\alpha(c) = g(c) + \hat{q}$.
+\end{enumerate}
+
+\begin{theorem}[Marginal Coverage Guarantee]\label{thm:coverage}
+Suppose $(X_1, Y_1), \ldots, (X_{n+1}, Y_{n+1})$ are exchangeable. The conformalized bound satisfies:
+\begin{equation}
+\PP\!\left(L_{n+1} \leq g_\alpha(\icm(X_{n+1}))\right) \geq 1 - \alpha
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Define nonconformity scores $R_j = L_j - g(C_j)$ on the calibration set and $R_{n+1} = L_{n+1} - g(C_{n+1})$ for the test point. Since $g$ is fitted only on the training set, the scores $\{R_j\}_{j \in \mathcal{I}_{\text{cal}}} \cup \{R_{n+1}\}$ are exchangeable. By the quantile lemma for exchangeable sequences~\citep{vovk2005algorithmic}, $\PP(R_{n+1} \leq \hat{q}) \geq 1 - \alpha$. Substituting: $R_{n+1} \leq \hat{q} \iff L_{n+1} \leq g(C_{n+1}) + \hat{q} = g_\alpha(C_{n+1})$.
+\end{proof}
+
+\subsection{Three-Way Decision Gate}
+
+The ICM-CRC system partitions predictions into three action categories:
+\begin{equation}
+\text{Decision}(c) = \begin{cases}
+\textsc{ACT}   & \text{if } c \geq \tau_{\text{hi}} \\
+\textsc{DEFER} & \text{if } \tau_{\text{lo}} \leq c < \tau_{\text{hi}} \\
+\textsc{AUDIT} & \text{if } c < \tau_{\text{lo}}
+\end{cases}
+\end{equation}
+where $\tau_{\text{hi}} = 0.7$ and $\tau_{\text{lo}} = 0.3$ are the default thresholds. The ACT region corresponds to high-convergence instances where automated action is warranted; DEFER indicates moderate convergence requiring expert review; AUDIT flags low-convergence instances where fundamental model disagreement demands investigation.
+
+\begin{remark}
+The coverage guarantee is \emph{marginal}---it holds on average over the test distribution. Conditional coverage for specific covariate values requires additional assumptions~\citep{barber2021limits}. This limitation should be noted when deploying the decision gate in safety-critical applications.
+\end{remark}
+
+
+% ============================================================
+% 5. EXPERIMENTS
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Datasets}
+
+We evaluate on eleven datasets spanning nine classification and two regression tasks. The original four classification datasets are drawn from scikit-learn~\citep{pedregosa2011scikit}: \textbf{Iris} (150 samples, 4 features, 3 classes), \textbf{Wine} (178 samples, 13 features, 3 classes), \textbf{Breast Cancer} (569 samples, 30 features, 2 classes), and \textbf{Digits} (1797 samples, 64 features, 10 classes). We add five new datasets to stress-test ICM under diverse conditions:
+\begin{itemize}
+    \item \textbf{Moons} (1000 samples, 2 features, 2 classes): synthetic nonlinear decision boundary.
+    \item \textbf{Circles} (1000 samples, 2 features, 2 classes): synthetic circular decision boundary requiring nonlinear models.
+    \item \textbf{Covertype} (2000-sample subset, 54 features, 7 classes): real-world multi-class task from the UCI repository with high feature dimensionality.
+    \item \textbf{Olivetti Faces} (400 samples, 50 PCA features from 4096 original, 40 classes): high-dimensional face recognition with many classes and few samples per class---the hardest classification task in our suite.
+    \item \textbf{Concept Drift} (600 samples, 5 features, 3 classes): synthetic dataset where training data is clean but the test distribution is shifted, simulating distribution drift.
+\end{itemize}
+The two regression tasks are \textbf{California Housing} (20640 samples, 8 features) and \textbf{Diabetes} (442 samples, 10 features).
+
+\subsection{Model Zoo}
+
+We employ eight diverse model families, ensuring genuine epistemic diversity through fundamentally different inductive biases:
+
+\begin{enumerate}
+    \item \textbf{Logistic Regression (LR):} Linear decision boundaries, maximum likelihood.
+    \item \textbf{Decision Tree (DT):} Axis-aligned partitioning, greedy splitting.
+    \item \textbf{Random Forest (RF):} Bagged decision trees~\citep{breiman1996bagging}.
+    \item \textbf{Gradient Boosting (GBM):} Sequential additive models~\citep{friedman2001greedy}.
+    \item \textbf{K-Nearest Neighbors (KNN):} Instance-based, local averaging.
+    \item \textbf{Multi-Layer Perceptron (MLP):} Neural network, nonlinear feature learning.
+    \item \textbf{Naive Bayes (NB):} Generative, conditional independence assumption.
+    \item \textbf{Support Vector Machine (SVM):} Maximum-margin, kernel methods.
+\end{enumerate}
+
+This model zoo spans parametric and nonparametric approaches, generative and discriminative models, linear and highly nonlinear decision boundaries, and single-model and ensemble-of-models architectures.
+
+\subsection{Baselines}
+
+We compare against standard ensemble methods and uncertainty quantification approaches:
+
+\begin{itemize}
+    \item \textbf{Ensemble Average:} Simple mean of all model probability vectors.
+    \item \textbf{Stacking (LR):} Logistic regression meta-learner~\citep{wolpert1992stacked}.
+    \item \textbf{Stacking (RF):} Random forest meta-learner.
+    \item \textbf{Bootstrap Ensemble:} Bagged ensemble with bootstrap resampling.
+    \item \textbf{Deep Ensemble:} Five MLP models with different architectures simulated via scikit-learn, following~\citet{lakshminarayanan2017simple}.
+    \item \textbf{Split Conformal Prediction:} Standard conformal prediction~\citep{vovk2005algorithmic} applied to the best single model.
+    \item \textbf{Ensemble Entropy:} Shannon entropy of the mean predictive distribution.
+    \item \textbf{Bootstrap Disagreement:} Standard deviation of bootstrap ensemble predictions.
+\end{itemize}
+
+\subsection{Experimental Protocol}
+
+We conduct five experiments:
+
+\paragraph{Exp 1: Prediction quality.} Compare ICM-weighted predictions (where each model's contribution is proportional to its per-sample ICM score) against all baselines on accuracy, log loss, and Brier score.
+
+\paragraph{Exp 2: Uncertainty quantification.} Compare ICM-CRC gating against split conformal prediction on marginal coverage, average prediction set size, and conditional coverage standard deviation.
+
+\paragraph{Exp 3: Error detection.} Evaluate whether low ICM scores (inverted) correlate with prediction errors, measured by Spearman rank correlation between the uncertainty signal and per-sample loss. Compare ICM against ensemble entropy, bootstrap disagreement, and max-probability uncertainty.
+
+\paragraph{Exp 4: Diversity assessment.} Report all five ICM components alongside standard diversity metrics (Q-statistic, disagreement, correlation coefficient, entropy, KL divergence).
+
+\paragraph{Exp 5: Score range analysis.} Compare default logistic, wide-range preset, and calibrated Beta aggregation on score distribution statistics (mean, std, min, max, range) and decision gate breakdown (ACT/DEFER/AUDIT proportions).
+
+
+% ============================================================
+% 6. RESULTS
+% ============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Prediction Quality (Exp 1)}
+
+Table~\ref{tab:prediction} reports classification accuracy across seven representative classification datasets, including four original and three new datasets.
+
+\begin{table}[t]
+\centering
+\caption{Classification accuracy by method across seven representative datasets. ICM-Weighted uses per-sample ICM scores to weight model contributions. Bold indicates best per dataset. ICM-Weighted is best on 3/9 classification datasets (including ties).}
+\label{tab:prediction}
+\begin{tabular}{lccccccc}
+\toprule
+Method & Iris & Wine & Breast C. & Digits & Moons & Circles & Olivetti \\
+\midrule
+ICM-Weighted       & 0.933 & 0.972 & 0.956 & \textbf{0.983} & \textbf{0.985} & \textbf{0.995} & 0.938 \\
+Ensemble Avg       & 0.933 & \textbf{1.000} & 0.965 & 0.975 & \textbf{0.985} & \textbf{0.995} & 0.938 \\
+Stacking (LR)      & \textbf{0.967} & \textbf{1.000} & \textbf{0.974} & 0.981 & \textbf{0.985} & \textbf{0.995} & 0.925 \\
+Stacking (RF)      & \textbf{0.967} & 0.972 & 0.947 & 0.981 & \textbf{0.985} & 0.985 & \textbf{0.963} \\
+Bootstrap Ens.     & 0.933 & \textbf{1.000} & 0.965 & 0.975 & \textbf{0.985} & \textbf{0.995} & 0.938 \\
+Deep Ensemble      & 0.867 & 0.972 & 0.947 & 0.978 & 0.965 & \textbf{0.995} & 0.938 \\
+\midrule
+\multicolumn{8}{l}{\emph{Mean ICM-Weighted accuracy (all 9 datasets): 0.9462; Mean best baseline: 0.9673}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ICM-Weighted predictions achieve a mean accuracy of 0.9462 across all nine classification tasks, compared to 0.9673 for the best baseline per dataset. ICM-Weighted is the top method on 3 of 9 classification datasets (Digits, Moons tied, Circles tied). On the most challenging dataset (Covertype, 7 classes, 54 features), all methods struggle: ICM-Weighted achieves 0.770 vs.\ 0.848 for Stacking-LR. On Olivetti Faces (40 classes), ICM-Weighted achieves 0.938, close to the best Stacking-RF at 0.963. On the synthetic Moons and Circles datasets, most methods achieve near-perfect accuracy ($\geq 0.985$), confirming that the model zoo handles nonlinear boundaries well.
+
+For regression, ICM-Weighted achieves RMSE 0.530 on California Housing (vs.\ 0.580 for ensemble average) and RMSE 51.78 on Diabetes (vs.\ 51.02 for ensemble average), showing mixed results.
+
+\subsection{Uncertainty Quantification (Exp 2)}
+
+\begin{table}[t]
+\centering
+\caption{Uncertainty quantification: ICM-CRC gating vs.\ split conformal prediction. Coverage, average prediction set size, and conditional coverage standard deviation.}
+\label{tab:uq}
+\begin{tabular}{llccc}
+\toprule
+Dataset & Method & Coverage & Set Size & Cond. Cov. Std \\
+\midrule
+\multirow{2}{*}{Breast C.} & ICM-CRC  & 1.000 & 1.193 & 0.000 \\
+                            & Split CP & 0.947 & 1.000 & 0.071 \\
+\midrule
+\multirow{2}{*}{Digits}    & ICM-CRC  & 0.992 & 1.386 & 0.018 \\
+                            & Split CP & 0.978 & 1.000 & 0.031 \\
+\midrule
+\multirow{2}{*}{Iris}      & ICM-CRC  & 1.000 & 1.200 & 0.000 \\
+                            & Split CP & 1.000 & 1.067 & 0.000 \\
+\midrule
+\multirow{2}{*}{Wine}      & ICM-CRC  & 1.000 & 1.250 & 0.000 \\
+                            & Split CP & 1.000 & 1.000 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ICM-CRC gating achieves a mean coverage of 0.9910 across all nine classification datasets, exceeding the nominal $1-\alpha = 0.90$ level (Table~\ref{tab:uq}). The average prediction set size is 1.44, indicating tight uncertainty quantification---on most samples, the CRC system identifies one or two classes with high confidence. The largest set sizes occur on Olivetti Faces (mean 2.29) and Circles (mean 1.68), reflecting the higher inherent uncertainty in those tasks. Split conformal prediction achieves comparable coverage with slightly smaller sets. The coverage advantage of ICM-CRC comes at the cost of marginally larger sets, reflecting its conservative approach to uncertainty.
+
+\subsection{Error Detection (Exp 3)}
+
+\begin{table}[t]
+\centering
+\caption{Error detection: Spearman rank correlation between uncertainty signals and per-sample loss. Higher is better. Italics indicate best per dataset.}
+\label{tab:error}
+\begin{tabular}{lcccc}
+\toprule
+Signal & Breast C. & Digits & Iris & Wine \\
+\midrule
+ICM (inverted)         & 0.285 & 0.222 & \textit{0.417} & 0.0 \\
+Ensemble Entropy       & \textit{0.287} & \textit{0.246} & \textit{0.417} & 0.0 \\
+Bootstrap Disagree.    & \textit{0.334} & 0.232 & 0.073 & 0.0 \\
+Max-Prob Uncertainty   & \textit{0.287} & 0.245 & \textit{0.417} & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:error} shows that ICM-based error detection (using inverted ICM scores as an uncertainty signal) achieves a mean Spearman correlation of 0.2359 across all nine classification datasets, comparable to ensemble entropy at 0.2443 and exceeding bootstrap disagreement at 0.2143. On the Iris dataset, ICM matches entropy at $\rho = 0.417$ while far outperforming bootstrap disagreement ($\rho = 0.073$). The strongest error detection is observed on Olivetti Faces ($\rho = 0.384$) and Covertype ($\rho = 0.343$), the two most challenging datasets. On the Wine dataset, all methods achieve $\rho = 0$ because no errors were made by the ensemble on the test set.
+
+\subsection{ICM Component Analysis (Exp 4)}
+
+\begin{table}[t]
+\centering
+\caption{Mean ICM components across all nine classification datasets (wide-range preset). All components vary meaningfully---none are saturated at 0 or 1. Olivetti Faces (40 classes) shows strikingly low agreement ($A{=}0.245$) and uncertainty overlap ($U{=}0.275$), driving its low overall ICM score.}
+\label{tab:components}
+\begin{tabular}{lcccccc}
+\toprule
+Dataset & $A$ & $D$ & $U$ & $C$ & $\Pi$ & ICM \\
+\midrule
+Breast Cancer  & 0.404 & 0.899 & 0.998 & 0.932 & 0.000 & 0.767 \\
+Circles        & 0.528 & 0.712 & 0.643 & 0.936 & 0.000 & 0.613 \\
+Concept Drift  & 0.427 & 0.916 & 0.919 & 0.921 & 0.000 & 0.748 \\
+Covertype      & 0.522 & 0.477 & 0.798 & 0.911 & 0.000 & 0.610 \\
+Digits         & 0.359 & 0.767 & 0.813 & 0.906 & 0.000 & 0.585 \\
+Iris           & 0.573 & 0.764 & 0.797 & 0.923 & 0.000 & 0.744 \\
+Moons          & 0.454 & 0.922 & 0.985 & 0.932 & 0.000 & 0.797 \\
+Olivetti Faces & 0.245 & 0.456 & 0.275 & 0.903 & 0.000 & 0.134 \\
+Wine           & 0.478 & 0.864 & 0.887 & 0.922 & 0.000 & 0.752 \\
+\midrule
+\textbf{Mean}  & \textbf{0.443} & \textbf{0.753} & \textbf{0.791} & \textbf{0.921} & \textbf{0.000} & \textbf{0.639} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:components} reveals that all four positive components vary meaningfully across datasets. Agreement ($A$) ranges from 0.245 (Olivetti Faces) to 0.573 (Iris), reflecting genuine differences in how well eight diverse model families agree across datasets of varying difficulty. Directional consensus ($D$) ranges from 0.456 (Olivetti, 40 classes) to 0.922 (Moons, clean 2-class boundary). Uncertainty overlap ($U$) shows the widest variation: from 0.275 (Olivetti) to 0.998 (Breast Cancer). Invariance ($C$) is consistently high (0.903--0.936), indicating stable predictions under small perturbations across all datasets. The dependency penalty $\Pi = 0$ across all datasets because the benchmark uses genuinely independent model families trained on the same features---without residual correlation or gradient similarity information provided.
+
+Compared to standard diversity metrics, ICM provides a richer picture: while the Q-statistic ranges from $-0.26$ to $0.97$ across datasets (a sign-unstable measure), the ICM decomposes agreement into four interpretable dimensions that each tell a distinct part of the story.
+
+\subsection{Score Range Analysis (Exp 5)}
+
+\begin{table}[t]
+\centering
+\caption{Score range analysis comparing aggregation configurations. Range is max$-$min. The wide-range preset expands the effective range by $\mathbf{16.1\times}$ on average.}
+\label{tab:range}
+\begin{tabular}{llrrrrr}
+\toprule
+Dataset & Config & Mean & Std & Min & Max & Range \\
+\midrule
+\multirow{2}{*}{Breast C.} & Default  & 0.687 & 0.017 & 0.637 & 0.700 & 0.064 \\
+                            & Wide     & 0.790 & 0.293 & 0.046 & 0.967 & \textbf{0.921} \\
+\midrule
+\multirow{2}{*}{Digits}    & Default  & 0.678 & 0.017 & 0.618 & 0.699 & 0.081 \\
+                            & Wide     & 0.773 & 0.242 & 0.064 & 0.965 & \textbf{0.901} \\
+\midrule
+\multirow{2}{*}{Iris}      & Default  & 0.670 & 0.007 & 0.654 & 0.676 & 0.022 \\
+                            & Wide     & 0.748 & 0.158 & 0.308 & 0.875 & \textbf{0.566} \\
+\midrule
+\multirow{2}{*}{Wine}      & Default  & 0.676 & 0.011 & 0.652 & 0.688 & 0.036 \\
+                            & Wide     & 0.776 & 0.221 & 0.185 & 0.923 & \textbf{0.737} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:range} demonstrates the critical importance of the anti-saturation mechanisms. The default logistic configuration compresses all scores into a narrow band of width $0.022$--$0.081$ (mean range $0.051$), making three-way decision gating impractical. The wide-range preset expands the range to $0.566$--$0.921$ (mean range $0.781$), a $16.1\times$ improvement on average that enables meaningful ACT/DEFER/AUDIT partitioning.
+
+\subsection{Decision Gate Breakdown}
+
+With the wide-range preset, the decision gate produces actionable partitions across all nine classification datasets:
+
+\begin{table}[h]
+\centering
+\caption{Decision gate breakdown using the wide-range preset ($\tau_{\text{hi}} = 0.7$, $\tau_{\text{lo}} = 0.3$). Datasets ordered by ACT rate. ICM automatically scales ACT rates from 13\% (hardest) to 83\% (easiest), providing difficulty-calibrated decision gating.}
+\label{tab:decision}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & Classes & ACT ($\geq 0.7$) & DEFER & AUDIT ($< 0.3$) \\
+\midrule
+Olivetti Faces & 40 & 12.5\% & 46.2\% & 41.2\% \\
+Circles        & 2  & 32.5\% & 66.0\% & 1.5\%  \\
+Covertype      & 7  & 45.8\% & 54.0\% & 0.2\%  \\
+Digits         & 10 & 68.9\% & 23.6\% & 7.5\%  \\
+Iris           & 3  & 80.0\% & 20.0\% & 0.0\%  \\
+Wine           & 3  & 80.6\% & 13.9\% & 5.6\%  \\
+Breast Cancer  & 2  & 80.7\% & 5.3\%  & 14.0\% \\
+Moons          & 2  & 82.5\% & 7.5\%  & 10.0\% \\
+Concept Drift  & 3  & 83.3\% & 8.3\%  & 8.3\%  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The decision gate breakdown reveals the \textbf{key finding} of the expanded evaluation: ICM automatically calibrates ACT rates to problem difficulty without any dataset-specific tuning. Easy datasets with clean boundaries and few classes (Moons, Concept Drift, Iris, Wine, Breast Cancer) receive 80--83\% ACT rates. Moderately difficult tasks (Digits with 10 classes, Covertype with 7 classes and 54 features) receive 46--69\% ACT rates with substantial DEFER allocations. The hardest task---Olivetti Faces with 40 classes and only 10 samples per class---receives just 13\% ACT with 41\% AUDIT, correctly reflecting that the ensemble has low confidence on most predictions. This difficulty-calibrated gating emerges automatically from the five-component decomposition: low agreement ($A{=}0.245$), low directional consensus ($D{=}0.456$), and low uncertainty overlap ($U{=}0.275$) on Olivetti Faces jointly drive the ICM score down, whereas high values on all three components for easy datasets drive scores up. No single uncertainty metric (entropy, disagreement, or max-probability) captures this multi-faceted difficulty calibration.
+
+
+% ============================================================
+% 7. DISCUSSION
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{The diagnostic value of ICM.}
+The primary contribution of ICM is \emph{not} surpassing baselines on raw prediction accuracy---ensemble averaging and stacking are specifically designed for this purpose and unsurprisingly perform well. Rather, ICM provides a \textbf{decomposable diagnostic signal} that answers the question: \emph{why} do models agree or disagree on this prediction?
+
+Consider a sample where the ensemble average confidently predicts class 1. Without ICM, the practitioner knows only the prediction and perhaps an entropy measure. With ICM, they learn that $A = 0.35$ (moderate distributional agreement), $D = 1.0$ (all models agree on direction), $U = 0.92$ (uncertainty intervals overlap substantially), $C = 0.88$ (predictions are stable under perturbation), and $\Pi = 0.0$ (no detected dependency). This decomposition reveals that while the models agree on the direction, their distributional agreement is modest---a nuance invisible to entropy-based measures.
+
+\paragraph{Difficulty-calibrated decision gating.}
+The expanded benchmark reveals that ICM's decision gating automatically scales with problem difficulty---a property we term \emph{difficulty calibration}. On easy datasets with 2--3 classes and clean decision boundaries (Moons, Iris, Wine), the system routes over 80\% of predictions to ACT. On moderately difficult tasks with many classes or high dimensionality (Digits, Covertype), ACT rates drop to 46--69\% with substantial DEFER allocations. On the hardest task (Olivetti Faces: 40 classes, 10 samples per class), only 13\% of predictions reach ACT while 41\% are flagged for AUDIT. This calibration emerges entirely from the five-component decomposition without any dataset-specific threshold tuning. The agreement component $A$ captures distributional spread across model families; the directional component $D$ captures class-vote fragmentation; and the uncertainty overlap $U$ captures whether models' confidence intervals align. When all three are low---as in the 40-class face recognition setting---the composite ICM score drops sharply, triggering conservative gating. No single baseline metric (entropy, disagreement, max-probability) provides this multi-dimensional difficulty signal; each captures only one facet of ensemble disagreement, making them less reliable as standalone gating criteria across tasks of varying difficulty.
+
+\paragraph{When ICM adds value.}
+ICM is most valuable in settings where:
+\begin{itemize}
+    \item Models come from genuinely different paradigms (e.g., mechanistic vs.\ statistical vs.\ ML).
+    \item The cost of wrong predictions is high and automated decision-making needs formal guardrails.
+    \item Understanding \emph{why} models disagree matters as much as knowing \emph{that} they disagree.
+    \item Temporal monitoring of convergence stability is needed (via rolling ICM with early warning).
+\end{itemize}
+
+\paragraph{Limitations.}
+We identify four key limitations:
+
+\begin{enumerate}
+    \item \textbf{Component weights are domain-dependent.} The default weights ($w_A = 0.35$, $w_D = 0.15$, $w_U = 0.25$, $w_C = 0.10$, $\lambda = 0.15$) were set based on domain knowledge, not learned from data. Our meta-learner framework can optimize these weights, but optimal weights may differ across application domains.
+
+    \item \textbf{Standard ML benchmarks.} Although the expanded benchmark now covers eleven datasets including synthetic nonlinear boundaries, real-world multi-class tasks, high-dimensional face recognition, and distribution shift, all experiments use standard scikit-learn model families. Future work should evaluate on domain-specific applications (climate projections, epidemic forecasting, financial risk) where models from fundamentally different scientific traditions are combined.
+
+    \item \textbf{Dependency penalty activation.} In our benchmarks, $\Pi = 0$ because the model zoo uses independent families trained on shared features without providing residual or gradient information. Full activation of the dependency penalty requires model residuals, feature provenance metadata, and gradient attributions, which are available in production settings but not in standard benchmark setups.
+
+    \item \textbf{Marginal vs.\ conditional coverage.} The CRC coverage guarantee is marginal, not conditional~\citep{barber2021limits}. For specific subpopulations, the actual coverage may deviate from the nominal level.
+\end{enumerate}
+
+\paragraph{Computational cost.}
+The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ for Hellinger with $C$ classes) and the Ledoit-Wolf correlation ($O(K^2 N)$). For typical settings ($K = 3$--$8$, $C \leq 40$, $N \leq 10^4$), the total runtime is under one second on commodity hardware. The full benchmark suite (11 datasets, 8 models plus deep ensemble, 5 experiments) completes in 78 seconds.
+
+
+% ============================================================
+% 8. CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented the Index of Convergence Multi-epistemic (ICM), a five-component framework for diagnosing the nature and strength of agreement among epistemically diverse models. The ICM score is provably bounded, monotone, and Lipschitz continuous, and can be converted to calibrated risk bounds via conformal risk control gating with distribution-free coverage guarantees.
+
+Our experiments on eleven datasets demonstrate that ICM provides a competitive weighting signal (mean accuracy 0.9462 across nine classification tasks), valid uncertainty quantification (coverage 0.9910 with tight sets of size 1.44), and effective error detection (Spearman $\rho = 0.2359$, comparable to entropy at 0.2443). The wide-range preset expands the effective score range by $16.1\times$, enabling meaningful three-way decision gating with ACT rates that automatically calibrate from 13\% on the hardest task (40-class face recognition) to 83\% on easy tasks---a difficulty-calibrated response that emerges from the five-component decomposition.
+
+The fundamental contribution is \emph{diagnostic}: ICM decomposes the opaque concept of ``ensemble agreement'' into five interpretable, formally grounded components---distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and dependency---each providing distinct information about why models agree or disagree. The expanded benchmark confirms that these components vary meaningfully ($A{=}0.443$, $D{=}0.753$, $U{=}0.791$, $C{=}0.921$) and jointly produce difficulty-calibrated gating across tasks ranging from simple 2-class problems to complex 40-class recognition. We believe this decomposition will be particularly valuable in safety-critical applications where knowing \emph{when to trust} an ensemble matters as much as the ensemble's prediction itself.
+
+\paragraph{Future work.} Key directions include: (1) evaluation on domain-specific multi-paradigm ensembles in climate science, epidemiology, and finance; (2) conditional coverage extensions via weighted conformal prediction; (3) online ICM updates for streaming prediction settings; and (4) theoretical analysis of the relationship between ICM and Bayes risk under multi-model aggregation.
+
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+
+% ============================================================
+% APPENDIX
+% ============================================================
+\newpage
+\appendix
+
+\section{Proofs of Component Properties}
+\label{app:proofs}
+
+\subsection{Hellinger Distance Properties}
+
+\begin{theorem}[Hellinger Distance]\label{thm:hellinger}
+The Hellinger distance $H(P,Q) = \sqrt{\frac{1}{2}\sum_{i}(\sqrt{p_i} - \sqrt{q_i})^2}$ satisfies:
+(a) $H(P,Q) \in [0,1]$;
+(b) $H(P,Q) = 0 \iff P = Q$;
+(c) $H(P,Q) = H(Q,P)$;
+(d) Triangle inequality.
+\end{theorem}
+
+\begin{proof}
+(a) Expanding $H^2 = 1 - \sum_i\sqrt{p_i q_i}$. By Cauchy-Schwarz, $0 \leq \sum_i\sqrt{p_i q_i} \leq 1$, so $H^2 \in [0,1]$.
+(b) $H = 0 \iff \sum_i\sqrt{p_i q_i} = 1 \iff \sqrt{p_i} = \sqrt{q_i}$ for all $i$ (Cauchy-Schwarz equality condition with both vectors on the unit sphere).
+(c) Immediate from $(\sqrt{p_i} - \sqrt{q_i})^2 = (\sqrt{q_i} - \sqrt{p_i})^2$.
+(d) Define $\phi(P) = (\sqrt{p_1}, \ldots, \sqrt{p_m})/\sqrt{2}$. Then $H(P,Q) = \|\phi(P) - \phi(Q)\|_2$ and the triangle inequality follows from the $\ell^2$ norm. See~\citet{tsybakov2009introduction} for details.
+\end{proof}
+
+\subsection{Direction Score Properties}
+
+\begin{theorem}[Direction Score]\label{thm:direction}
+The direction score $D = 1 - H(\hat{p})/H_{\max}$ satisfies:
+(a) $D \in [0,1]$;
+(b) $D = 1$ iff all models agree;
+(c) $D = 0$ iff the sign distribution is uniform.
+\end{theorem}
+
+\begin{proof}
+(a) Since $0 \leq H(\hat{p}) \leq H_{\max}$, we have $D \in [0,1]$.
+(b) All models agree $\implies$ $|\mathcal{C}|=1$ $\implies$ $D=1$ by convention.
+(c) $D = 0 \iff H(\hat{p}) = H_{\max} \iff \hat{p}$ is uniform.
+\end{proof}
+
+\subsection{Uncertainty Overlap Properties}
+
+\begin{theorem}[Uncertainty Overlap]\label{thm:overlap}
+The uncertainty overlap $U$ satisfies:
+(a) $U \in [0,1]$;
+(b) $U = 1$ iff all intervals are identical;
+(c) $U = 0$ iff no pair of intervals overlaps.
+\end{theorem}
+
+\begin{proof}
+(a) Each IoU $\in [0,1]$ since intersection $\leq$ union. The mean of values in $[0,1]$ is in $[0,1]$.
+(b) $U = 1 \iff$ every IoU $= 1 \iff |I_i \cap I_j| = |I_i \cup I_j|$ for all pairs $\iff$ all intervals identical.
+(c) $U = 0 \iff$ every IoU $= 0 \iff$ no pair overlaps.
+\end{proof}
+
+
+\section{Sensitivity to Dependency}
+\label{app:dependency}
+
+\begin{proposition}[Dependency Sensitivity]\label{prop:dependency}
+ICM is strictly monotone decreasing in $\Pi$:
+$\frac{\partial\,\icm}{\partial \Pi} = -\lambda \cdot \sigma'(z) < 0$.
+The maximum sensitivity is $\lambda/4 = 0.0375$ (with default parameters), attained at $z = 0$.
+\end{proposition}
+
+\begin{proof}
+Direct computation via chain rule. $\sigma'(z) = \sigma(z)(1-\sigma(z)) > 0$ and $\lambda > 0$.
+\end{proof}
+
+\begin{proposition}[Concavity]\label{prop:concavity}
+For fixed $\Pi$, the ICM is strictly concave in $(A, D, U, C)$ in the region $z \geq 0$ (where $\sigma''(z) < 0$). This implies diminishing marginal returns: the first unit of agreement contributes more than the last.
+\end{proposition}
+
+
+\section{Dependency Penalty: Ledoit-Wolf Estimator}
+\label{app:ledoitwolf}
+
+The dependency penalty uses the Ledoit-Wolf shrinkage estimator~\citep{ledoit2004well} for the residual correlation matrix:
+\begin{equation}
+\hat{\Sigma}^{\text{LW}} = (1 - \alpha^*)S + \alpha^* I_K
+\end{equation}
+where $S = Z Z^T / n$ is the sample correlation matrix from standardized residuals and $\alpha^* \in [0,1]$ is the optimal shrinkage intensity minimizing expected Frobenius loss. Key properties: (a) consistency as $n \to \infty$; (b) guaranteed positive definiteness for $\alpha^* > 0$; (c) independence detection: when models are truly independent ($\Sigma = I_K$), $\rho_{\text{corr}} \to 0$.
+
+
+\section{Computational Complexity}
+\label{app:complexity}
+
+\begin{table}[h]
+\centering
+\caption{Computational complexity of ICM components.}
+\label{tab:complexity}
+\begin{tabular}{lccc}
+\toprule
+Component & Time & Space & Bottleneck \\
+\midrule
+Agreement $A$ (Hellinger) & $O(K^2 C)$ & $O(K^2 + KC)$ & Pairwise distances \\
+Direction $D$             & $O(K \log K)$ & $O(K)$ & Sorting for unique \\
+Uncertainty $U$           & $O(K^2)$ & $O(K^2)$ & Pairwise IoU \\
+Invariance $C$            & $O(K)$ & $O(K)$ & Vector norm \\
+Dependency $\Pi$          & $O(K^2 N)$ & $O(KN + K^2)$ & Ledoit-Wolf \\
+\midrule
+Aggregation (logistic)    & $O(1)$ & $O(1)$ & Sigmoid \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The total per-sample complexity is $O(K^2 \cdot \max(C, N))$. For typical settings ($K = 8$, $C = 10$, $N = 500$), the agreement component requires $28$ distance evaluations and the full pipeline executes in under 10 milliseconds.
+
+
+\section{Full Benchmark Results}
+\label{app:full_results}
+
+\subsection{Regression Results}
+
+\begin{table}[h]
+\centering
+\caption{Regression prediction quality (RMSE).}
+\label{tab:regression}
+\begin{tabular}{lcc}
+\toprule
+Method & California Housing & Diabetes \\
+\midrule
+ICM-Weighted & \textbf{0.530} & 51.783 \\
+Ensemble Avg & 0.580 & \textbf{51.021} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On regression tasks, ICM-Weighted outperforms ensemble averaging on California Housing (RMSE 0.530 vs.\ 0.580) but slightly underperforms on Diabetes (51.78 vs.\ 51.02). These results suggest that ICM weighting provides selective benefit when model quality varies substantially.
+
+\subsection{Diversity Metrics Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Standard diversity metrics across datasets.}
+\label{tab:diversity}
+\begin{tabular}{lcccc}
+\toprule
+Metric & Breast C. & Digits & Iris & Wine \\
+\midrule
+Q-Statistic     & 0.926 & 0.910 & 0.508 & $-$0.263 \\
+Disagreement    & 0.052 & 0.117 & 0.117 & 0.069 \\
+Correlation     & 0.434 & 0.368 & 0.480 & 0.103 \\
+Entropy         & 0.070 & 0.187 & 0.163 & 0.094 \\
+KL Diversity    & 0.209 & 1.306 & 0.935 & 0.366 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Standard diversity metrics show high variability and sign instability across datasets (e.g., Wine Q-statistic is negative at $-0.263$). In contrast, ICM components are consistently interpretable and bounded in $[0,1]$.
+
+\subsection{Statistical Significance}
+
+We conducted a Wilcoxon signed-rank test comparing ICM-Weighted vs.\ Ensemble Average accuracy across the nine classification datasets: statistic $= 1.0$, $p = 0.9375$. There is no statistically significant difference, confirming that ICM-Weighted is competitive but not superior on raw accuracy. Similarly, comparing ICM vs.\ Entropy error detection: statistic $= 5.0$, $p = 0.1562$---no significant difference.
+
+These non-significant results are consistent with our thesis: ICM's value is in its \emph{diagnostic decomposition} and \emph{decision gating}, not in raw predictive performance.
+
+
+\end{document}

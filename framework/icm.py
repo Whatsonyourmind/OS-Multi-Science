@@ -201,12 +201,18 @@ def compute_agreement(
     Compute pairwise distances among K model predictions, take the mean,
     normalize by C_A, and map to [0, 1] via  A = 1 - mean_d / C_A.
 
+    When ``config.C_A_mode == "adaptive"``, C_A is computed from the
+    empirical distribution of pairwise distances (at the percentile given
+    by ``config.C_A_adaptive_percentile``), preventing saturation when
+    genuinely diverse models produce large distances.
+
     Parameters
     ----------
     predictions : list of K arrays, each representing one model's output
         distribution or prediction vector.
     distance_fn : one of {"hellinger", "wasserstein", "mmd"}.
     C_A : normalization constant.  If None, read from *config* or default.
+        Ignored when C_A_mode is "adaptive".
     config : ICMConfig (used for default C_A and bandwidth).
 
     Returns
@@ -220,13 +226,6 @@ def compute_agreement(
     if K < 2:
         return 1.0  # Trivial agreement with a single model
 
-    if C_A is None:
-        C_A = {
-            "hellinger": config.C_A_hellinger,
-            "wasserstein": config.C_A_wasserstein,
-            "mmd": config.C_A_mmd,
-        }.get(distance_fn, 1.0)
-
     dist_fn = _resolve_distance_fn(distance_fn, config)
 
     # Pairwise distances
@@ -236,12 +235,33 @@ def compute_agreement(
             dists.append(dist_fn(predictions[i], predictions[j]))
 
     mean_d = float(np.mean(dists))
-    A = 1.0 - min(mean_d / C_A, 1.0)
+
+    # Determine normalization constant
+    if config.C_A_mode == "adaptive":
+        # Use the empirical percentile of observed distances as C_A.
+        # This prevents saturation: only the most extreme disagreements
+        # map to A=0; moderate disagreement maps to moderate A.
+        #
+        # We add 10% headroom beyond the percentile so that even when all
+        # distances are similar (low variance), the mean still maps to a
+        # non-trivial A value rather than collapsing to 0.
+        p_val = float(np.percentile(dists, config.C_A_adaptive_percentile))
+        C_A_eff = p_val * 1.1 + 1e-12
+    elif C_A is not None:
+        C_A_eff = C_A
+    else:
+        C_A_eff = {
+            "hellinger": config.C_A_hellinger,
+            "wasserstein": config.C_A_wasserstein,
+            "mmd": config.C_A_mmd,
+        }.get(distance_fn, 1.0)
+
+    A = 1.0 - min(mean_d / C_A_eff, 1.0)
     return float(np.clip(A, 0.0, 1.0))
 
 
 def compute_direction(signs_or_gradients: NDArray) -> float:
-    """Direction/sign agreement D_i.
+    """Direction/sign agreement D_i (legacy mode).
 
     D = 1 - H(sign_distribution) / log(K)
 
@@ -278,6 +298,59 @@ def compute_direction(signs_or_gradients: NDArray) -> float:
 
     D = 1.0 - H / H_max
     return float(np.clip(D, 0.0, 1.0))
+
+
+def compute_direction_argmax(predictions: Sequence[NDArray]) -> float:
+    """Direction agreement based on argmax class predictions.
+
+    For each sample, checks whether all models agree on the predicted
+    class (argmax of the probability vector).  Uses vote-entropy to
+    quantify per-sample agreement, then averages over samples.
+
+    D = 1 means all models predict the same class on every sample.
+    D = 0 means models are maximally split on every sample.
+
+    Parameters
+    ----------
+    predictions : list of K arrays, each of shape (n_samples, n_classes)
+        or (n_samples,) for regression/scalar outputs.
+
+    Returns
+    -------
+    float  D in [0, 1].
+    """
+    pred_arrays = [np.asarray(p, dtype=np.float64) for p in predictions]
+    K = len(pred_arrays)
+    if K <= 1:
+        return 1.0
+
+    # Get argmax per model.  For 1-D predictions, fall back to sign-based.
+    if pred_arrays[0].ndim == 1 or (pred_arrays[0].ndim == 2 and pred_arrays[0].shape[1] == 1):
+        # Not classification probabilities; fall back to sign-based direction
+        means = np.array([float(np.mean(p)) for p in pred_arrays])
+        return compute_direction(means)
+
+    # Classification: shape (n_samples, n_classes)
+    argmax_per_model = [np.argmax(p, axis=1) for p in pred_arrays]
+    argmax_matrix = np.stack(argmax_per_model)  # (K, n_samples)
+
+    n_samples = argmax_matrix.shape[1]
+    D_per_sample: list[float] = []
+    for j in range(n_samples):
+        votes = argmax_matrix[:, j]
+        unique, counts = np.unique(votes, return_counts=True)
+        if len(unique) <= 1:
+            D_per_sample.append(1.0)
+            continue
+        probs = counts / counts.sum()
+        H = -float(np.sum(probs * np.log(probs + 1e-12)))
+        H_max = float(np.log(len(unique)))
+        if H_max < 1e-12:
+            D_per_sample.append(1.0)
+        else:
+            D_per_sample.append(1.0 - H / H_max)
+
+    return float(np.clip(np.mean(D_per_sample), 0.0, 1.0))
 
 
 def compute_uncertainty_overlap(intervals: Sequence[tuple[float, float]]) -> float:
@@ -890,9 +963,23 @@ def compute_icm_from_predictions(
     if signs is not None:
         D = compute_direction(signs)
     else:
-        # Derive signs from mean predictions
-        means = np.array([np.mean(p) for p in preds_list])
-        D = compute_direction(means)
+        # Choose direction mode based on config
+        direction_mode = config.direction_mode
+        if direction_mode == "auto":
+            # Auto-detect: use argmax if predictions look like classification
+            # (2-D arrays with >1 column), sign otherwise.
+            first = np.asarray(preds_list[0])
+            if first.ndim == 2 and first.shape[1] > 1:
+                direction_mode = "argmax"
+            else:
+                direction_mode = "sign"
+
+        if direction_mode == "argmax":
+            D = compute_direction_argmax(preds_list)
+        else:
+            # Legacy: derive signs from mean predictions
+            means = np.array([np.mean(p) for p in preds_list])
+            D = compute_direction(means)
 
     # --- U: uncertainty overlap ---
     if intervals is not None:
@@ -915,7 +1002,26 @@ def compute_icm_from_predictions(
     if pre_scores is not None and post_scores is not None:
         C_val = compute_invariance(pre_scores, post_scores)
     else:
-        C_val = 1.0  # Assume stable if no perturbation provided
+        # Auto-generate perturbation when perturbation_scale > 0
+        if config.perturbation_scale > 0.0 and K >= 1:
+            rng = np.random.default_rng(0)
+            pre_vals: list[float] = []
+            post_vals: list[float] = []
+            for p in preds_list:
+                p_arr = np.asarray(p, dtype=np.float64)
+                p_flat = p_arr.ravel()
+                # Scale noise to data magnitude
+                p_std = float(np.std(p_flat)) + 1e-12
+                noise = rng.normal(
+                    0, config.perturbation_scale * p_std, size=p_flat.shape,
+                )
+                pre_vals.extend(p_flat.tolist())
+                post_vals.extend((p_flat + noise).tolist())
+            C_val = compute_invariance(
+                np.array(pre_vals), np.array(post_vals),
+            )
+        else:
+            C_val = 1.0  # Assume stable if no perturbation provided
 
     # --- Pi: dependency penalty ---
     # Auto-compute Pi from y_true when no explicit residuals are provided.

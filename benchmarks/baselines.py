@@ -25,6 +25,7 @@ import pandas as pd
 from scipy.stats import entropy as _scipy_entropy
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
 
 
@@ -722,6 +723,171 @@ class DiversityMetrics:
         if not kl_values:
             return 0.0
         return float(np.mean(kl_values))
+
+
+# ============================================================
+# Baseline 6: Deep Ensemble (MLP-based)
+# ============================================================
+
+class DeepEnsemble:
+    """Simulated deep ensemble using sklearn MLPClassifier.
+
+    Trains 5 MLP models with different architectures (varying hidden
+    layer sizes) and different random seeds to simulate the diversity
+    found in deep ensembles.  Predictions are averaged across all
+    ensemble members.
+
+    This mirrors the deep ensemble approach from Lakshminarayanan et al.
+    (2017) without requiring PyTorch or TensorFlow.
+
+    Parameters
+    ----------
+    n_members : int
+        Number of ensemble members (default 5).
+    max_iter : int
+        Maximum training iterations per member.
+    seed : int
+        Base random seed (each member uses seed + i).
+    """
+
+    # 5 architecturally diverse MLP configurations
+    _ARCHITECTURES = [
+        (32,),              # Shallow, narrow
+        (64, 32),           # Medium depth
+        (128, 64, 32),      # Deep
+        (64, 64),           # Uniform width
+        (128, 32),          # Wide-then-narrow
+    ]
+
+    def __init__(
+        self,
+        n_members: int = 5,
+        max_iter: int = 300,
+        seed: int = 42,
+    ) -> None:
+        self.n_members = min(n_members, len(self._ARCHITECTURES))
+        self.max_iter = max_iter
+        self.seed = seed
+        self._models: list[MLPClassifier] = []
+        self._fitted = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Train all ensemble members on the same data.
+
+        Each member uses a different architecture and random seed,
+        creating genuine diversity in the ensemble.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+        y : array of shape (n_samples,)
+        """
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y)
+        self._models = []
+
+        for i in range(self.n_members):
+            mlp = MLPClassifier(
+                hidden_layer_sizes=self._ARCHITECTURES[i],
+                max_iter=self.max_iter,
+                random_state=self.seed + i,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=10,
+            )
+            mlp.fit(X, y)
+            self._models.append(mlp)
+
+        self._fitted = True
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Return averaged probability predictions from all members.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples, n_classes)
+        """
+        if not self._fitted:
+            raise RuntimeError("DeepEnsemble must be fit() before predict_proba().")
+
+        X = np.asarray(X, dtype=np.float64)
+        probas = [m.predict_proba(X) for m in self._models]
+        return np.mean(probas, axis=0)
+
+    def predict_proba_per_member(self, X: np.ndarray) -> list[np.ndarray]:
+        """Return individual member probability predictions.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+
+        Returns
+        -------
+        list of np.ndarray, each of shape (n_samples, n_classes)
+        """
+        if not self._fitted:
+            raise RuntimeError("DeepEnsemble must be fit() before predict_proba_per_member().")
+
+        X = np.asarray(X, dtype=np.float64)
+        return [m.predict_proba(X) for m in self._models]
+
+    def score(
+        self,
+        X: np.ndarray,
+        y_true: np.ndarray,
+    ) -> dict[str, float]:
+        """Return accuracy, log_loss, brier_score for ensemble predictions.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+        y_true : true labels of shape (n_samples,)
+
+        Returns
+        -------
+        dict with keys 'accuracy', 'log_loss', 'brier_score'.
+        """
+        proba = self.predict_proba(X)
+        return _compute_standard_scores(proba, y_true)
+
+    def disagreement(self, X: np.ndarray) -> np.ndarray:
+        """Per-sample disagreement among ensemble members.
+
+        Measured as the mean pairwise Jensen-Shannon divergence
+        across member predictions.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples,) with disagreement scores >= 0.
+        """
+        probas = self.predict_proba_per_member(X)
+        n_members = len(probas)
+        n_samples = probas[0].shape[0]
+        disagreement = np.zeros(n_samples)
+
+        count = 0
+        for i in range(n_members):
+            for j in range(i + 1, n_members):
+                p = np.clip(probas[i], 1e-15, 1.0)
+                q = np.clip(probas[j], 1e-15, 1.0)
+                m = 0.5 * (p + q)
+                jsd = 0.5 * np.sum(p * np.log(p / m), axis=1) + \
+                      0.5 * np.sum(q * np.log(q / m), axis=1)
+                disagreement += jsd
+                count += 1
+
+        if count > 0:
+            disagreement /= count
+
+        return disagreement
 
 
 # ============================================================

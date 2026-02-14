@@ -32,6 +32,24 @@ class ICMConfig:
     C_A_wasserstein: float = 10.0  # Wasserstein normalization (domain-dependent)
     C_A_mmd: float = 1.0  # MMD normalization
 
+    # Agreement normalization mode: "fixed" uses C_A_* constants directly;
+    # "adaptive" computes C_A from the empirical percentile of observed
+    # pairwise distances, preventing saturation with diverse model families.
+    C_A_mode: str = "fixed"
+    C_A_adaptive_percentile: float = 90.0  # Percentile for adaptive C_A
+
+    # Direction mode: "sign" uses np.sign of mean predictions (legacy);
+    # "argmax" uses argmax class-vote entropy for classification predictions.
+    # "auto" selects "argmax" when predictions are 2-D, "sign" otherwise.
+    direction_mode: str = "sign"  # legacy default; use "auto" via wide_range_preset()
+
+    # Perturbation scale for invariance computation.  When
+    # compute_icm_from_predictions auto-generates perturbation noise, the
+    # standard deviation is  perturbation_scale * std(predictions).
+    # The legacy default (0.01 absolute) is equivalent to perturbation_scale=0
+    # (disabled adaptive scaling).  Set > 0 to scale noise to the data.
+    perturbation_scale: float = 0.0  # 0 = legacy absolute noise (0.01 std)
+
     # Kernel parameters
     mmd_bandwidth: float = 1.0  # RBF kernel bandwidth for MMD
 
@@ -61,15 +79,28 @@ class ICMConfig:
             raise ValueError(f"Beta shape parameters must be positive, got a={self.beta_shape_a}, b={self.beta_shape_b}")
         if self.aggregation not in ("logistic", "geometric", "calibrated", "adaptive"):
             raise ValueError(f"Unknown aggregation mode: {self.aggregation!r}")
+        if self.C_A_mode not in ("fixed", "adaptive"):
+            raise ValueError(f"C_A_mode must be 'fixed' or 'adaptive', got {self.C_A_mode!r}")
+        if not 0.0 < self.C_A_adaptive_percentile <= 100.0:
+            raise ValueError(f"C_A_adaptive_percentile must be in (0, 100], got {self.C_A_adaptive_percentile}")
+        if self.direction_mode not in ("sign", "argmax", "auto"):
+            raise ValueError(f"direction_mode must be 'sign', 'argmax', or 'auto', got {self.direction_mode!r}")
+        if self.perturbation_scale < 0.0:
+            raise ValueError(f"perturbation_scale must be non-negative, got {self.perturbation_scale}")
 
     @classmethod
     def wide_range_preset(cls, **overrides) -> "ICMConfig":
-        """Config preset with wide ICM score range.
+        """Config preset with wide ICM score range and anti-saturation defaults.
 
         Uses logistic_scale=10.0, logistic_shift=0.5 so that the logistic
         sigmoid maps component combinations to nearly the full [0, 1] range
         instead of the narrow ~[0.46, 0.70] band produced by the legacy
         defaults (scale=1, shift=0).
+
+        Also enables anti-saturation features:
+        - C_A_mode="adaptive": calibrates agreement normalization from data
+        - direction_mode="auto": uses argmax for classification, sign for regression
+        - perturbation_scale=0.1: scales perturbation noise to data magnitude
 
         With these settings:
         - All components ~ 0 (total disagreement): ICM ~ 0.007
@@ -79,7 +110,13 @@ class ICMConfig:
         Any keyword argument accepted by ICMConfig can be passed as an
         override.
         """
-        defaults = dict(logistic_scale=10.0, logistic_shift=0.5)
+        defaults = dict(
+            logistic_scale=10.0,
+            logistic_shift=0.5,
+            C_A_mode="adaptive",
+            direction_mode="auto",
+            perturbation_scale=0.1,
+        )
         defaults.update(overrides)
         return cls(**defaults)
 

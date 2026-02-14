@@ -1421,3 +1421,477 @@ class TestScaleShiftPiIntegration:
         assert result_lo.icm_score < 0.3, (
             f"Low convergence score {result_lo.icm_score:.4f} > 0.3"
         )
+
+
+# ============================================================
+# Anti-Saturation Fix 1: Adaptive Agreement (C_A)
+# ============================================================
+
+class TestAdaptiveAgreement:
+    """Tests for adaptive C_A normalization to prevent A saturation."""
+
+    def test_adaptive_mode_prevents_zero_agreement(self):
+        """With diverse multi-sample predictions, adaptive mode gives non-zero A.
+
+        The adaptive C_A mode is designed for the real-world case where models
+        produce multi-sample predictions.  Some model pairs are close on some
+        samples and far on others, creating variance in pairwise distances.
+        The 90th percentile captures the 'reasonable upper bound' for C_A,
+        preventing saturation.
+        """
+        rng = np.random.default_rng(42)
+        n_samples = 50
+        n_classes = 4
+
+        # 8 diverse models with different class-preference patterns
+        preds = []
+        for i in range(8):
+            alpha = np.ones(n_classes) * 0.5
+            alpha[i % n_classes] = 5.0
+            preds.append(rng.dirichlet(alpha, size=n_samples))
+
+        # Fixed mode with C_A=1.0: for diverse models with high mean Hellinger
+        # distances, A saturates near 0.
+        config_fixed = ICMConfig(C_A_mode="fixed")
+        A_fixed = compute_agreement(preds, distance_fn="hellinger", config=config_fixed)
+
+        # Adaptive mode: normalizes by data-dependent C_A, producing non-zero A
+        config_adaptive = ICMConfig(C_A_mode="adaptive")
+        A_adaptive = compute_agreement(preds, distance_fn="hellinger", config=config_adaptive)
+
+        # Adaptive should give A > 0 even when fixed mode gives very low A
+        assert A_adaptive > 0.0, f"Adaptive A should be > 0, got {A_adaptive:.4f}"
+        # Adaptive should give measurably different (higher) result than fixed
+        assert A_adaptive > A_fixed, (
+            f"Adaptive A ({A_adaptive:.4f}) should exceed fixed A ({A_fixed:.4f})"
+        )
+
+    def test_adaptive_identical_predictions_still_gives_one(self):
+        """Identical predictions should give A=1 even with adaptive mode."""
+        p = np.array([0.25, 0.25, 0.25, 0.25])
+        config = ICMConfig(C_A_mode="adaptive")
+        A = compute_agreement([p, p, p], distance_fn="hellinger", config=config)
+        assert A == pytest.approx(1.0, abs=1e-6)
+
+    def test_adaptive_bounded_0_1(self):
+        """Adaptive agreement is always bounded in [0, 1]."""
+        rng = np.random.default_rng(100)
+        config = ICMConfig(C_A_mode="adaptive")
+        for _ in range(50):
+            preds = [rng.dirichlet(np.ones(5)) for _ in range(6)]
+            A = compute_agreement(preds, distance_fn="hellinger", config=config)
+            assert 0.0 <= A <= 1.0 + 1e-10
+
+    def test_adaptive_percentile_affects_result(self):
+        """Different percentile settings should produce different A values."""
+        rng = np.random.default_rng(42)
+        preds = [rng.dirichlet(np.ones(4)) for _ in range(5)]
+
+        config_50 = ICMConfig(C_A_mode="adaptive", C_A_adaptive_percentile=50.0)
+        config_99 = ICMConfig(C_A_mode="adaptive", C_A_adaptive_percentile=99.0)
+
+        A_50 = compute_agreement(preds, distance_fn="hellinger", config=config_50)
+        A_99 = compute_agreement(preds, distance_fn="hellinger", config=config_99)
+
+        # Higher percentile -> larger C_A -> higher A for the same distances
+        assert A_99 >= A_50 - 1e-10, (
+            f"A with 99th percentile ({A_99:.4f}) should be >= A with 50th ({A_50:.4f})"
+        )
+
+    def test_adaptive_with_wasserstein(self):
+        """Adaptive mode works with wasserstein distance too."""
+        config = ICMConfig(C_A_mode="adaptive")
+        p1 = np.array([1.0, 2.0, 3.0])
+        p2 = np.array([10.0, 20.0, 30.0])
+        p3 = np.array([100.0, 200.0, 300.0])
+        A = compute_agreement([p1, p2, p3], distance_fn="wasserstein", config=config)
+        assert 0.0 <= A <= 1.0
+
+    def test_fixed_mode_backward_compatible(self):
+        """Fixed mode produces the same result as before."""
+        p1 = np.array([1.0, 0.0])
+        p2 = np.array([0.0, 1.0])
+        config_fixed = ICMConfig(C_A_mode="fixed")
+        config_default = ICMConfig()
+        A_fixed = compute_agreement([p1, p2], distance_fn="hellinger", config=config_fixed)
+        A_default = compute_agreement([p1, p2], distance_fn="hellinger", config=config_default)
+        assert A_fixed == pytest.approx(A_default, abs=1e-12)
+
+    def test_adaptive_monotonicity(self):
+        """As predictions converge, adaptive A should generally increase.
+
+        Note: adaptive mode normalizes by the observed distance distribution,
+        so the mapping is non-trivial.  We test that the extreme cases
+        (very noisy vs nearly identical) are correctly ordered.
+        """
+        config = ICMConfig(C_A_mode="adaptive")
+        base = np.array([0.4, 0.3, 0.2, 0.1])
+
+        # Very noisy -> low agreement
+        rng_noisy = np.random.default_rng(42)
+        preds_noisy = []
+        for _ in range(4):
+            noisy = base + rng_noisy.normal(0, 2.0, 4)
+            noisy = np.abs(noisy)
+            noisy /= noisy.sum()
+            preds_noisy.append(noisy)
+        A_noisy = compute_agreement(preds_noisy, distance_fn="hellinger", config=config)
+
+        # Nearly identical -> high agreement
+        rng_tight = np.random.default_rng(42)
+        preds_tight = []
+        for _ in range(4):
+            noisy = base + rng_tight.normal(0, 0.001, 4)
+            noisy = np.abs(noisy)
+            noisy /= noisy.sum()
+            preds_tight.append(noisy)
+        A_tight = compute_agreement(preds_tight, distance_fn="hellinger", config=config)
+
+        assert A_tight > A_noisy, (
+            f"A_tight ({A_tight:.4f}) should be > A_noisy ({A_noisy:.4f})"
+        )
+
+    def test_config_validation_C_A_mode(self):
+        """Invalid C_A_mode should raise ValueError."""
+        with pytest.raises(ValueError, match="C_A_mode"):
+            ICMConfig(C_A_mode="invalid")
+
+    def test_config_validation_percentile(self):
+        """Invalid percentile should raise ValueError."""
+        with pytest.raises(ValueError, match="C_A_adaptive_percentile"):
+            ICMConfig(C_A_adaptive_percentile=0.0)
+        with pytest.raises(ValueError, match="C_A_adaptive_percentile"):
+            ICMConfig(C_A_adaptive_percentile=101.0)
+
+
+# ============================================================
+# Anti-Saturation Fix 2: Argmax Direction
+# ============================================================
+
+class TestDirectionArgmax:
+    """Tests for argmax-based direction agreement for classification."""
+
+    def test_all_models_agree_on_class(self):
+        """All models predict the same class -> D=1."""
+        from framework.icm import compute_direction_argmax
+        # 3 models, 5 samples, 3 classes
+        preds = [
+            np.array([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8], [0.8, 0.1, 0.1], [0.1, 0.8, 0.1]]),
+            np.array([[0.7, 0.2, 0.1], [0.2, 0.7, 0.1], [0.1, 0.2, 0.7], [0.6, 0.3, 0.1], [0.2, 0.6, 0.2]]),
+            np.array([[0.9, 0.05, 0.05], [0.05, 0.9, 0.05], [0.05, 0.05, 0.9], [0.85, 0.1, 0.05], [0.1, 0.7, 0.2]]),
+        ]
+        D = compute_direction_argmax(preds)
+        assert D == pytest.approx(1.0, abs=1e-6), f"All agree on argmax -> D=1, got {D:.4f}"
+
+    def test_models_disagree_on_class(self):
+        """Models predict different classes -> D < 1."""
+        from framework.icm import compute_direction_argmax
+        # 4 models, 1 sample, 4 classes -- each model picks a different class
+        preds = [
+            np.array([[0.9, 0.03, 0.03, 0.04]]),
+            np.array([[0.03, 0.9, 0.03, 0.04]]),
+            np.array([[0.03, 0.03, 0.9, 0.04]]),
+            np.array([[0.04, 0.03, 0.03, 0.9]]),
+        ]
+        D = compute_direction_argmax(preds)
+        assert D < 0.5, f"All disagree -> D should be low, got {D:.4f}"
+
+    def test_argmax_bounded_0_1(self):
+        """Argmax direction is always in [0, 1]."""
+        from framework.icm import compute_direction_argmax
+        rng = np.random.default_rng(42)
+        for _ in range(30):
+            n_models = rng.integers(2, 8)
+            n_samples = rng.integers(5, 50)
+            n_classes = rng.integers(2, 6)
+            preds = [rng.dirichlet(np.ones(n_classes), size=n_samples) for _ in range(n_models)]
+            D = compute_direction_argmax(preds)
+            assert 0.0 <= D <= 1.0 + 1e-10
+
+    def test_argmax_single_model(self):
+        """Single model -> D=1."""
+        from framework.icm import compute_direction_argmax
+        pred = np.array([[0.5, 0.3, 0.2], [0.1, 0.8, 0.1]])
+        D = compute_direction_argmax([pred])
+        assert D == pytest.approx(1.0)
+
+    def test_argmax_falls_back_to_sign_for_1d(self):
+        """For 1-D predictions, argmax should fall back to sign-based direction."""
+        from framework.icm import compute_direction_argmax
+        preds = [np.array([0.5, 0.7, 0.3]), np.array([0.6, 0.8, 0.4])]
+        D = compute_direction_argmax(preds)
+        # All positive -> sign all +1 -> D=1
+        assert D == pytest.approx(1.0, abs=1e-6)
+
+    def test_auto_mode_uses_argmax_for_2d(self):
+        """Auto direction mode should use argmax for 2-D classification predictions."""
+        # Models disagree on class
+        preds = {
+            "m1": np.array([[0.9, 0.1], [0.9, 0.1], [0.9, 0.1]]),
+            "m2": np.array([[0.1, 0.9], [0.1, 0.9], [0.1, 0.9]]),
+        }
+        # With auto mode (default), predictions are 2-D -> uses argmax
+        config_auto = ICMConfig(direction_mode="auto", C_A_mode="fixed")
+        result_auto = compute_icm_from_predictions(preds, config=config_auto)
+
+        # With sign mode, mean predictions are both positive -> D=1
+        config_sign = ICMConfig(direction_mode="sign", C_A_mode="fixed")
+        result_sign = compute_icm_from_predictions(preds, config=config_sign)
+
+        assert result_auto.components.D < result_sign.components.D, (
+            f"Auto D ({result_auto.components.D:.4f}) should be < sign D ({result_sign.components.D:.4f}) "
+            f"when models disagree on class"
+        )
+
+    def test_auto_mode_uses_sign_for_1d(self):
+        """Auto direction mode should use sign for 1-D regression predictions."""
+        preds = {
+            "m1": np.array([1.0, 2.0, 3.0]),
+            "m2": np.array([1.1, 2.1, 3.1]),
+        }
+        config = ICMConfig(direction_mode="auto", C_A_mode="fixed")
+        result = compute_icm_from_predictions(
+            preds, config=config, distance_fn="wasserstein",
+        )
+        # Both positive means -> sign = +1 -> D = 1
+        assert result.components.D == pytest.approx(1.0, abs=1e-6)
+
+    def test_config_validation_direction_mode(self):
+        """Invalid direction_mode should raise ValueError."""
+        with pytest.raises(ValueError, match="direction_mode"):
+            ICMConfig(direction_mode="invalid")
+
+    def test_argmax_partial_agreement(self):
+        """When some models agree and some disagree, D is intermediate."""
+        from framework.icm import compute_direction_argmax
+        # 4 models, 1 sample: 3 agree on class 0, 1 disagrees
+        preds = [
+            np.array([[0.8, 0.1, 0.1]]),
+            np.array([[0.7, 0.2, 0.1]]),
+            np.array([[0.6, 0.3, 0.1]]),
+            np.array([[0.1, 0.1, 0.8]]),  # disagrees
+        ]
+        D = compute_direction_argmax(preds)
+        assert 0.0 < D < 1.0, f"Partial agreement -> intermediate D, got {D:.4f}"
+
+    def test_argmax_direction_not_trivially_one_for_diverse_models(self):
+        """Classification with diverse models should NOT trivially give D=1."""
+        from framework.icm import compute_direction_argmax
+        rng = np.random.default_rng(42)
+        # Simulate 8 genuinely diverse models on 100 samples, 4 classes
+        preds = []
+        for _ in range(8):
+            # Each model has different Dirichlet concentration -> different class preferences
+            alpha = rng.uniform(0.1, 5.0, size=4)
+            preds.append(rng.dirichlet(alpha, size=100))
+        D = compute_direction_argmax(preds)
+        assert D < 1.0, f"Diverse models should not give D=1, got {D:.4f}"
+
+
+# ============================================================
+# Anti-Saturation Fix 3: Perturbation Scale for Invariance
+# ============================================================
+
+class TestPerturbationScale:
+    """Tests for perturbation_scale-based invariance computation."""
+
+    def test_perturbation_scale_zero_gives_one(self):
+        """With perturbation_scale=0 (legacy), C should be 1.0."""
+        config = ICMConfig(perturbation_scale=0.0, C_A_mode="fixed", direction_mode="sign")
+        preds = {
+            "m1": np.array([0.4, 0.3, 0.2, 0.1]),
+            "m2": np.array([0.35, 0.25, 0.25, 0.15]),
+        }
+        result = compute_icm_from_predictions(preds, config=config)
+        assert result.components.C == pytest.approx(1.0, abs=1e-6)
+
+    def test_perturbation_scale_positive_gives_less_than_one(self):
+        """With perturbation_scale > 0, C should be < 1.0."""
+        config = ICMConfig(perturbation_scale=0.1, C_A_mode="fixed", direction_mode="sign")
+        preds = {
+            "m1": np.array([0.4, 0.3, 0.2, 0.1]),
+            "m2": np.array([0.35, 0.25, 0.25, 0.15]),
+        }
+        result = compute_icm_from_predictions(preds, config=config)
+        assert result.components.C < 1.0, f"C should be < 1 with perturbation, got {result.components.C:.4f}"
+        assert result.components.C > 0.0, f"C should be > 0, got {result.components.C:.4f}"
+
+    def test_larger_perturbation_gives_lower_invariance(self):
+        """Larger perturbation_scale should give lower C."""
+        preds = {
+            "m1": np.array([0.5, 0.3, 0.15, 0.05]),
+            "m2": np.array([0.4, 0.35, 0.15, 0.1]),
+            "m3": np.array([0.45, 0.25, 0.2, 0.1]),
+        }
+
+        config_small = ICMConfig(perturbation_scale=0.05, C_A_mode="fixed", direction_mode="sign")
+        config_large = ICMConfig(perturbation_scale=0.5, C_A_mode="fixed", direction_mode="sign")
+
+        result_small = compute_icm_from_predictions(preds, config=config_small)
+        result_large = compute_icm_from_predictions(preds, config=config_large)
+
+        assert result_small.components.C > result_large.components.C, (
+            f"Small perturbation C ({result_small.components.C:.4f}) should be > "
+            f"large perturbation C ({result_large.components.C:.4f})"
+        )
+
+    def test_perturbation_scale_bounded_0_1(self):
+        """Invariance from perturbation is always in [0, 1]."""
+        rng = np.random.default_rng(42)
+        for scale in [0.01, 0.1, 0.5, 1.0, 2.0]:
+            config = ICMConfig(perturbation_scale=scale, C_A_mode="fixed", direction_mode="sign")
+            preds = {f"m{i}": rng.dirichlet(np.ones(4)) for i in range(3)}
+            result = compute_icm_from_predictions(preds, config=config)
+            assert 0.0 <= result.components.C <= 1.0 + 1e-10
+
+    def test_config_validation_perturbation_scale(self):
+        """Negative perturbation_scale should raise ValueError."""
+        with pytest.raises(ValueError, match="perturbation_scale"):
+            ICMConfig(perturbation_scale=-0.1)
+
+    def test_explicit_pre_post_overrides_perturbation_scale(self):
+        """When pre_scores and post_scores are given, perturbation_scale is ignored."""
+        config = ICMConfig(perturbation_scale=10.0, C_A_mode="fixed", direction_mode="sign")
+        pre = np.array([1.0, 2.0, 3.0])
+        post = np.array([1.0, 2.0, 3.0])  # no change
+        preds = {
+            "m1": np.array([0.5, 0.5]),
+            "m2": np.array([0.4, 0.6]),
+        }
+        result = compute_icm_from_predictions(
+            preds, config=config, pre_scores=pre, post_scores=post,
+        )
+        assert result.components.C == pytest.approx(1.0, abs=1e-6)
+
+
+# ============================================================
+# Wide Range Preset Integration with Anti-Saturation
+# ============================================================
+
+class TestWideRangeAntiSaturation:
+    """Integration tests for wide_range_preset with anti-saturation features."""
+
+    def test_wide_range_preset_has_adaptive_defaults(self):
+        """wide_range_preset should enable adaptive features by default."""
+        config = ICMConfig.wide_range_preset()
+        assert config.C_A_mode == "adaptive"
+        assert config.direction_mode == "auto"
+        assert config.perturbation_scale == 0.1
+
+    def test_wide_range_preset_overrides_work(self):
+        """wide_range_preset overrides should take effect."""
+        config = ICMConfig.wide_range_preset(C_A_mode="fixed", direction_mode="sign", perturbation_scale=0.0)
+        assert config.C_A_mode == "fixed"
+        assert config.direction_mode == "sign"
+        assert config.perturbation_scale == 0.0
+        # logistic_scale/shift should still be set
+        assert config.logistic_scale == 10.0
+        assert config.logistic_shift == 0.5
+
+    def test_diverse_classification_models_non_degenerate_components(self):
+        """With wide_range_preset, diverse classification models should have non-degenerate components."""
+        rng = np.random.default_rng(42)
+        config = ICMConfig.wide_range_preset()
+
+        # Simulate 6 diverse models on 50 samples, 4 classes
+        n_samples, n_classes = 50, 4
+        preds = {}
+        for i in range(6):
+            # Each model has distinct class-preference patterns
+            alpha = rng.uniform(0.1, 3.0, size=n_classes)
+            preds[f"model_{i}"] = rng.dirichlet(alpha, size=n_samples)
+
+        result = compute_icm_from_predictions(preds, config=config)
+
+        # A should NOT be 0 (the original saturation problem)
+        assert result.components.A > 0.01, (
+            f"A={result.components.A:.4f} should not saturate to 0 with adaptive mode"
+        )
+        # D should NOT be trivially 1.0 (argmax direction measures real disagreement)
+        assert result.components.D < 0.999, (
+            f"D={result.components.D:.4f} should not saturate to 1 with argmax mode"
+        )
+        # C should NOT be trivially 1.0 (perturbation_scale adds noise)
+        assert result.components.C < 0.999, (
+            f"C={result.components.C:.4f} should not saturate to 1 with perturbation"
+        )
+        # Score should be bounded
+        assert 0.0 <= result.icm_score <= 1.0
+
+    def test_all_five_components_vary_across_scenarios(self):
+        """All 5 components should produce meaningfully different values for different scenarios."""
+        rng = np.random.default_rng(42)
+        config = ICMConfig.wide_range_preset()
+
+        # Scenario 1: Models largely agree (similar distributions)
+        base = rng.dirichlet([5, 3, 1, 1], size=30)
+        agree_preds = {f"m{i}": base + rng.normal(0, 0.02, base.shape) for i in range(4)}
+        for k in agree_preds:
+            agree_preds[k] = np.clip(agree_preds[k], 1e-6, None)
+            agree_preds[k] /= agree_preds[k].sum(axis=1, keepdims=True)
+
+        # Scenario 2: Models strongly disagree
+        disagree_preds = {}
+        for i in range(4):
+            alpha = np.ones(4)
+            alpha[i] = 10.0  # Each model favors a different class
+            disagree_preds[f"m{i}"] = rng.dirichlet(alpha, size=30)
+
+        r_agree = compute_icm_from_predictions(agree_preds, config=config)
+        r_disagree = compute_icm_from_predictions(disagree_preds, config=config)
+
+        # Agreement should be higher for agreeing models
+        assert r_agree.components.A > r_disagree.components.A, (
+            f"A_agree ({r_agree.components.A:.4f}) should be > A_disagree ({r_disagree.components.A:.4f})"
+        )
+        # Direction should be higher for agreeing models (same argmax class)
+        assert r_agree.components.D > r_disagree.components.D, (
+            f"D_agree ({r_agree.components.D:.4f}) should be > D_disagree ({r_disagree.components.D:.4f})"
+        )
+        # ICM score should be higher for agreeing models
+        assert r_agree.icm_score > r_disagree.icm_score, (
+            f"ICM_agree ({r_agree.icm_score:.4f}) should be > ICM_disagree ({r_disagree.icm_score:.4f})"
+        )
+
+
+# ============================================================
+# Backward Compatibility for New Config Options
+# ============================================================
+
+class TestNewConfigBackwardCompatibility:
+    """Ensure new config options have backward-compatible defaults."""
+
+    def test_default_config_new_fields(self):
+        """Default ICMConfig should have backward-compatible defaults for new fields."""
+        config = ICMConfig()
+        assert config.C_A_mode == "fixed"  # legacy default
+        assert config.C_A_adaptive_percentile == 90.0
+        assert config.direction_mode == "sign"  # legacy default
+        assert config.perturbation_scale == 0.0  # legacy: no auto-perturbation
+
+    def test_default_config_produces_same_results_as_before(self):
+        """Default config should produce the same ICM as legacy."""
+        # With direction_mode="sign", agreement/direction are unchanged.
+        # With C_A_mode="fixed", agreement is the same.
+        # With perturbation_scale=0, invariance is 1.0.
+        p = np.array([0.5, 0.3, 0.15, 0.05])
+        preds = {f"m{i}": p.copy() for i in range(3)}
+        config = ICMConfig()
+        result = compute_icm_from_predictions(preds, config=config)
+        # These should be the same as the legacy behavior
+        assert result.components.A == pytest.approx(1.0, abs=1e-6)
+        assert result.components.D == pytest.approx(1.0, abs=1e-6)
+        assert result.components.C == pytest.approx(1.0, abs=1e-6)
+
+    def test_explicit_signs_override_direction_mode(self):
+        """When signs are explicitly passed, direction_mode is ignored."""
+        preds = {
+            "m1": np.array([[0.9, 0.1], [0.9, 0.1]]),
+            "m2": np.array([[0.1, 0.9], [0.1, 0.9]]),
+        }
+        config = ICMConfig(direction_mode="argmax", C_A_mode="fixed")
+        # Explicit signs: all +1 -> D = 1
+        result = compute_icm_from_predictions(
+            preds, config=config, signs=np.array([1.0, 1.0]),
+        )
+        assert result.components.D == pytest.approx(1.0, abs=1e-6)

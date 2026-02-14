@@ -15,7 +15,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from benchmarks.datasets import load_dataset, list_classification_datasets, list_regression_datasets
+from benchmarks.datasets import (
+    load_dataset,
+    list_classification_datasets,
+    list_regression_datasets,
+    list_datasets,
+    get_dataset_info,
+)
+from benchmarks.baselines import DeepEnsemble
 from benchmarks.model_zoo import (
     build_classification_zoo,
     build_regression_zoo,
@@ -645,3 +652,342 @@ class TestEdgeCases:
         if comps:  # Should be non-empty with classification datasets
             for key in ["A", "D", "U", "C", "Pi", "ICM"]:
                 assert key in comps
+
+
+# ============================================================
+# New Datasets
+# ============================================================
+
+class TestNewDatasets:
+    """Tests for newly added datasets (moons, circles, concept_drift, etc.)."""
+
+    def test_moons_in_registry(self):
+        """Moons dataset should be in the classification registry."""
+        assert "moons" in list_classification_datasets()
+
+    def test_circles_in_registry(self):
+        """Circles dataset should be in the classification registry."""
+        assert "circles" in list_classification_datasets()
+
+    def test_concept_drift_in_registry(self):
+        """Concept drift dataset should be in the classification registry."""
+        assert "concept_drift" in list_classification_datasets()
+
+    def test_moons_loads_correctly(self):
+        """Moons dataset should load with correct shapes and types."""
+        X_train, X_test, y_train, y_test = load_dataset("moons", seed=42)
+        assert X_train.shape[1] == 2  # 2D features
+        assert X_train.shape[0] == 800  # 80% of 1000
+        assert X_test.shape[0] == 200  # 20% of 1000
+        assert len(np.unique(y_train)) == 2  # binary
+        assert y_train.dtype == np.int64
+
+    def test_circles_loads_correctly(self):
+        """Circles dataset should load with correct shapes and types."""
+        X_train, X_test, y_train, y_test = load_dataset("circles", seed=42)
+        assert X_train.shape[1] == 2  # 2D features
+        assert X_train.shape[0] == 800
+        assert X_test.shape[0] == 200
+        assert len(np.unique(y_train)) == 2  # binary
+        assert y_train.dtype == np.int64
+
+    def test_concept_drift_loads_correctly(self):
+        """Concept drift dataset should load with shifted test distribution."""
+        X_train, X_test, y_train, y_test = load_dataset("concept_drift", seed=42)
+        assert X_train.shape[1] == 5  # 5 features
+        assert X_train.shape[0] == 480  # 3 classes * 160 per class
+        assert X_test.shape[0] == 120  # 3 classes * 40 per class
+        assert len(np.unique(y_train)) == 3  # 3 classes
+        assert len(np.unique(y_test)) == 3
+        assert y_train.dtype == np.int64
+
+    def test_concept_drift_distribution_differs(self):
+        """Train and test means should differ for concept drift dataset.
+
+        The test set is generated from a shifted distribution, so
+        the per-feature means should differ significantly.
+        """
+        X_train, X_test, _, _ = load_dataset("concept_drift", seed=42)
+        # After standardization, train mean should be ~0
+        train_mean = np.abs(X_train.mean(axis=0)).mean()
+        # Test mean should differ from 0 due to distribution shift
+        test_mean = np.abs(X_test.mean(axis=0)).mean()
+        # The test set comes from a shifted distribution, so its mean
+        # should be further from zero than the training set
+        assert test_mean > train_mean
+
+    def test_moons_experiment1(self):
+        """Experiment 1 should run on moons dataset."""
+        X_train, X_test, y_train, y_test = load_dataset("moons", seed=42)
+        exp1 = experiment_prediction_quality(
+            "moons", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        assert not exp1["results_table"].empty
+        methods = list(exp1["results_table"]["method"])
+        assert "ICM-Weighted" in methods
+        assert "Deep Ensemble" in methods
+
+    def test_circles_experiment1(self):
+        """Experiment 1 should run on circles dataset."""
+        X_train, X_test, y_train, y_test = load_dataset("circles", seed=42)
+        exp1 = experiment_prediction_quality(
+            "circles", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        assert not exp1["results_table"].empty
+        accs = exp1["results_table"]["accuracy"].dropna()
+        assert all(0.0 <= a <= 1.0 for a in accs)
+
+    def test_concept_drift_experiment1(self):
+        """Experiment 1 should run on concept drift dataset."""
+        X_train, X_test, y_train, y_test = load_dataset("concept_drift", seed=42)
+        exp1 = experiment_prediction_quality(
+            "concept_drift", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        assert not exp1["results_table"].empty
+
+    def test_moons_nonlinear_accuracy(self):
+        """Models should achieve reasonable accuracy on moons (nonlinear boundary)."""
+        X_train, X_test, y_train, y_test = load_dataset("moons", seed=42)
+        exp1 = experiment_prediction_quality(
+            "moons", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        icm_row = exp1["results_table"][exp1["results_table"]["method"] == "ICM-Weighted"]
+        assert float(icm_row["accuracy"].iloc[0]) > 0.85
+
+    def test_new_datasets_count(self):
+        """At least 8 classification datasets should be registered."""
+        clf = list_classification_datasets()
+        assert len(clf) >= 8
+
+    def test_all_datasets_have_info(self):
+        """All registered datasets should have valid info."""
+        for ds_name in list_datasets():
+            info = get_dataset_info(ds_name)
+            assert "description" in info
+            assert "task" in info
+            assert info["task"] in ("classification", "regression")
+
+    def test_dataset_reproducibility(self):
+        """Loading a dataset twice with same seed should give identical results."""
+        for ds_name in ["moons", "circles", "concept_drift"]:
+            X1, Xt1, y1, yt1 = load_dataset(ds_name, seed=42)
+            X2, Xt2, y2, yt2 = load_dataset(ds_name, seed=42)
+            np.testing.assert_array_equal(X1, X2)
+            np.testing.assert_array_equal(Xt1, Xt2)
+            np.testing.assert_array_equal(y1, y2)
+            np.testing.assert_array_equal(yt1, yt2)
+
+    def test_different_seeds_give_different_splits(self):
+        """Different seeds should produce different train/test splits."""
+        X1, _, _, _ = load_dataset("moons", seed=42)
+        X2, _, _, _ = load_dataset("moons", seed=99)
+        # Splits should differ (extremely unlikely to be identical)
+        assert not np.array_equal(X1, X2)
+
+
+# ============================================================
+# Conditional datasets (may not be available)
+# ============================================================
+
+class TestConditionalDatasets:
+    """Tests for datasets that may or may not be available."""
+
+    def test_covertype_if_available(self):
+        """Covertype should load correctly if available."""
+        if "covertype" not in list_classification_datasets():
+            pytest.skip("Covertype not available")
+        X_train, X_test, y_train, y_test = load_dataset("covertype", seed=42)
+        assert X_train.shape[1] == 54
+        assert len(np.unique(y_train)) >= 2  # At least 2 classes
+        # All class labels should be 0-indexed
+        assert y_train.min() >= 0
+
+    def test_olivetti_faces_if_available(self):
+        """Olivetti faces should load correctly if available."""
+        if "olivetti_faces" not in list_classification_datasets():
+            pytest.skip("Olivetti faces not available")
+        X_train, X_test, y_train, y_test = load_dataset("olivetti_faces", seed=42)
+        assert X_train.shape[1] == 50  # PCA-reduced
+        assert len(np.unique(y_train)) == 40  # 40 classes
+        assert y_train.dtype == np.int64
+
+    def test_olivetti_faces_experiment1(self):
+        """Experiment 1 should run on olivetti faces."""
+        if "olivetti_faces" not in list_classification_datasets():
+            pytest.skip("Olivetti faces not available")
+        X_train, X_test, y_train, y_test = load_dataset("olivetti_faces", seed=42)
+        exp1 = experiment_prediction_quality(
+            "olivetti_faces", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        assert not exp1["results_table"].empty
+        # With 40 classes, accuracy should be reasonable (> 0.5)
+        icm_row = exp1["results_table"][exp1["results_table"]["method"] == "ICM-Weighted"]
+        assert float(icm_row["accuracy"].iloc[0]) > 0.50
+
+
+# ============================================================
+# Deep Ensemble Baseline
+# ============================================================
+
+class TestDeepEnsemble:
+    """Tests for the DeepEnsemble baseline."""
+
+    def test_deep_ensemble_creates_5_members(self):
+        """DeepEnsemble should create 5 MLP members by default."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, _, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        assert len(de._models) == 5
+
+    def test_deep_ensemble_predict_proba_shape(self):
+        """predict_proba should return (n_samples, n_classes)."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, y_test = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        proba = de.predict_proba(X_test)
+        n_classes = len(np.unique(y_train))
+        assert proba.shape == (len(X_test), n_classes)
+
+    def test_deep_ensemble_probas_sum_to_one(self):
+        """Predicted probabilities should sum to 1 for each sample."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        proba = de.predict_proba(X_test)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_deep_ensemble_probas_nonneg(self):
+        """Predicted probabilities should be non-negative."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        proba = de.predict_proba(X_test)
+        assert np.all(proba >= 0.0)
+
+    def test_deep_ensemble_score_format(self):
+        """score() should return dict with accuracy, log_loss, brier_score."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, y_test = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        scores = de.score(X_test, y_test)
+        assert "accuracy" in scores
+        assert "log_loss" in scores
+        assert "brier_score" in scores
+        assert 0.0 <= scores["accuracy"] <= 1.0
+        assert scores["log_loss"] >= 0.0
+        assert scores["brier_score"] >= 0.0
+
+    def test_deep_ensemble_reasonable_accuracy(self):
+        """DeepEnsemble should achieve reasonable accuracy on iris."""
+        de = DeepEnsemble(n_members=5, max_iter=200, seed=42)
+        X_train, X_test, y_train, y_test = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        scores = de.score(X_test, y_test)
+        assert scores["accuracy"] > 0.6  # Should do better than random
+
+    def test_deep_ensemble_per_member_predictions(self):
+        """predict_proba_per_member should return list of 5 arrays."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        per_member = de.predict_proba_per_member(X_test)
+        assert len(per_member) == 5
+        for arr in per_member:
+            assert arr.shape == (len(X_test), len(np.unique(y_train)))
+
+    def test_deep_ensemble_member_diversity(self):
+        """Different MLP architectures should produce different predictions."""
+        de = DeepEnsemble(n_members=5, max_iter=100, seed=42)
+        X_train, X_test, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        per_member = de.predict_proba_per_member(X_test)
+        # At least some members should differ
+        diffs = []
+        for i in range(len(per_member)):
+            for j in range(i + 1, len(per_member)):
+                diffs.append(np.mean(np.abs(per_member[i] - per_member[j])))
+        assert max(diffs) > 1e-6, "All ensemble members are identical"
+
+    def test_deep_ensemble_disagreement_shape(self):
+        """disagreement() should return (n_samples,) non-negative values."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_train, X_test, y_train, _ = load_dataset("iris", seed=42)
+        de.fit(X_train, y_train)
+        dis = de.disagreement(X_test)
+        assert dis.shape == (len(X_test),)
+        assert np.all(dis >= 0.0)
+
+    def test_deep_ensemble_not_fitted_raises(self):
+        """Calling predict before fit should raise RuntimeError."""
+        de = DeepEnsemble(n_members=5, max_iter=50, seed=42)
+        X_test = np.random.randn(10, 4)
+        with pytest.raises(RuntimeError):
+            de.predict_proba(X_test)
+        with pytest.raises(RuntimeError):
+            de.predict_proba_per_member(X_test)
+
+    def test_deep_ensemble_binary_classification(self):
+        """DeepEnsemble should work on binary classification."""
+        de = DeepEnsemble(n_members=5, max_iter=100, seed=42)
+        X_train, X_test, y_train, y_test = load_dataset("breast_cancer", seed=42)
+        de.fit(X_train, y_train)
+        scores = de.score(X_test, y_test)
+        assert scores["accuracy"] > 0.80  # Should do well on breast cancer
+
+    def test_deep_ensemble_in_benchmark(self):
+        """Deep Ensemble should appear in exp1 results."""
+        X_train, X_test, y_train, y_test = load_dataset("iris", seed=42)
+        exp1 = experiment_prediction_quality(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+        )
+        methods = list(exp1["results_table"]["method"])
+        assert "Deep Ensemble" in methods
+
+    def test_deep_ensemble_on_nonlinear_data(self):
+        """DeepEnsemble should handle nonlinear boundaries (moons)."""
+        de = DeepEnsemble(n_members=5, max_iter=200, seed=42)
+        X_train, X_test, y_train, y_test = load_dataset("moons", seed=42)
+        de.fit(X_train, y_train)
+        scores = de.score(X_test, y_test)
+        assert scores["accuracy"] > 0.85
+
+
+# ============================================================
+# Expanded Benchmark Integration
+# ============================================================
+
+class TestExpandedBenchmarkIntegration:
+    """Integration tests for the expanded benchmark with all datasets."""
+
+    def test_expanded_benchmark_includes_new_datasets(self):
+        """Full benchmark should include new datasets."""
+        results = run_soa_benchmark(seed=42, verbose=False)
+        for ds_name in ["moons", "circles", "concept_drift"]:
+            assert ds_name in results["dataset_results"], f"Missing: {ds_name}"
+
+    def test_expanded_benchmark_deep_ensemble_present(self):
+        """Deep Ensemble should be present in all classification results."""
+        results = run_soa_benchmark(seed=42, verbose=False)
+        for ds_name, ds_data in results["dataset_results"].items():
+            info = ds_data.get("info", {})
+            if info.get("task") != "classification":
+                continue
+            exp1 = ds_data.get("exp1_prediction_quality", {})
+            if "results_table" in exp1 and not exp1["results_table"].empty:
+                methods = list(exp1["results_table"]["method"])
+                assert "Deep Ensemble" in methods, (
+                    f"Deep Ensemble missing from {ds_name}"
+                )
+
+    def test_expanded_aggregate_has_more_data(self):
+        """Aggregate results should cover more datasets with expansion."""
+        results = run_soa_benchmark(seed=42, verbose=False)
+        agg = results["aggregate_results"]
+        # Should have at least 7 classification datasets in accuracy ranking
+        assert len(agg["exp1_accuracy_ranking"]) >= 7
