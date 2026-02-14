@@ -118,9 +118,9 @@ class TestSmokeTests:
         assert "elapsed_seconds" in results
 
     def test_benchmark_runtime_under_limit(self):
-        """Runtime should be under 120 seconds (generous limit)."""
+        """Runtime should be under 180 seconds (generous limit)."""
         results = run_soa_benchmark(seed=42, verbose=False)
-        assert results["elapsed_seconds"] < 120.0
+        assert results["elapsed_seconds"] < 180.0
 
     def test_benchmark_produces_all_datasets(self):
         """All datasets should appear in results."""

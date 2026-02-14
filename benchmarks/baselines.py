@@ -732,13 +732,18 @@ class DiversityMetrics:
 class DeepEnsemble:
     """Simulated deep ensemble using sklearn MLPClassifier.
 
-    Trains 5 MLP models with different architectures (varying hidden
-    layer sizes) and different random seeds to simulate the diversity
-    found in deep ensembles.  Predictions are averaged across all
-    ensemble members.
+    Trains 5 MLP models with genuinely diverse architectures, activation
+    functions, learning rates, and regularization to simulate the diversity
+    found in deep ensembles. Predictions are averaged across all ensemble
+    members.
 
     This mirrors the deep ensemble approach from Lakshminarayanan et al.
-    (2017) without requiring PyTorch or TensorFlow.
+    (2017) without requiring PyTorch or TensorFlow. Each member differs in:
+    - Hidden layer architecture (different depths and widths)
+    - Activation function (relu vs tanh)
+    - Learning rate (different learning_rate_init values)
+    - Regularization strength (different alpha/L2 penalty values)
+    - Random seed (for weight initialization)
 
     Parameters
     ----------
@@ -750,13 +755,40 @@ class DeepEnsemble:
         Base random seed (each member uses seed + i).
     """
 
-    # 5 architecturally diverse MLP configurations
+    # 5 architecturally diverse MLP configurations with varying depths/widths
     _ARCHITECTURES = [
         (32,),              # Shallow, narrow
-        (64, 32),           # Medium depth
-        (128, 64, 32),      # Deep
-        (64, 64),           # Uniform width
-        (128, 32),          # Wide-then-narrow
+        (64, 32),           # Medium depth, decreasing width
+        (128, 64, 32),      # Deep, narrowing
+        (96, 96),           # Wide, uniform depth
+        (256, 128, 64),     # Very deep, narrowing
+    ]
+
+    # Activation functions to alternate diversity
+    _ACTIVATIONS = [
+        "relu",             # Member 0
+        "tanh",             # Member 1
+        "relu",             # Member 2
+        "tanh",             # Member 3
+        "relu",             # Member 4
+    ]
+
+    # Learning rates to add optimization diversity
+    _LEARNING_RATES = [
+        0.001,              # Member 0: conservative learning
+        0.005,              # Member 1: moderate learning
+        0.01,               # Member 2: standard learning
+        0.002,              # Member 3: slow learning
+        0.003,              # Member 4: slow-moderate learning
+    ]
+
+    # L2 regularization strength (alpha) for diversity in weight decay
+    _REGULARIZATION = [
+        1e-5,               # Member 0: minimal regularization
+        1e-4,               # Member 1: light regularization
+        1e-3,               # Member 2: moderate regularization
+        5e-4,               # Member 3: medium regularization
+        2e-4,               # Member 4: light-moderate regularization
     ]
 
     def __init__(
@@ -774,8 +806,14 @@ class DeepEnsemble:
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Train all ensemble members on the same data.
 
-        Each member uses a different architecture and random seed,
-        creating genuine diversity in the ensemble.
+        Each member uses a different combination of:
+        - Architecture (hidden layer structure)
+        - Activation function
+        - Learning rate
+        - Regularization strength
+        - Random seed
+
+        This creates genuine architectural and optimization diversity.
 
         Parameters
         ----------
@@ -789,11 +827,15 @@ class DeepEnsemble:
         for i in range(self.n_members):
             mlp = MLPClassifier(
                 hidden_layer_sizes=self._ARCHITECTURES[i],
+                activation=self._ACTIVATIONS[i],
+                learning_rate_init=self._LEARNING_RATES[i],
+                alpha=self._REGULARIZATION[i],
                 max_iter=self.max_iter,
                 random_state=self.seed + i,
                 early_stopping=True,
                 validation_fraction=0.15,
                 n_iter_no_change=10,
+                solver='adam',  # Adam optimizer handles diverse learning rates well
             )
             mlp.fit(X, y)
             self._models.append(mlp)

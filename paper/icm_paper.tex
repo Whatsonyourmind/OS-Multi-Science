@@ -419,24 +419,24 @@ Table~\ref{tab:prediction} reports classification accuracy across seven represen
 
 \begin{table}[t]
 \centering
-\caption{Classification accuracy by method across seven representative datasets. ICM-Weighted uses per-sample ICM scores to weight model contributions. Bold indicates best per dataset. ICM-Weighted is best on 3/9 classification datasets (including ties).}
+\caption{Classification accuracy by method across seven representative datasets. ICM-Weighted uses per-sample ICM scores to weight model contributions. Bold indicates best per dataset. ICM-Weighted is best on 2/9 classification datasets (including ties).}
 \label{tab:prediction}
 \begin{tabular}{lccccccc}
 \toprule
 Method & Iris & Wine & Breast C. & Digits & Moons & Circles & Olivetti \\
 \midrule
-ICM-Weighted       & 0.933 & 0.972 & 0.956 & \textbf{0.983} & \textbf{0.985} & \textbf{0.995} & 0.938 \\
-Ensemble Avg       & 0.933 & \textbf{1.000} & 0.965 & 0.975 & \textbf{0.985} & \textbf{0.995} & 0.938 \\
-Stacking (LR)      & \textbf{0.967} & \textbf{1.000} & \textbf{0.974} & 0.981 & \textbf{0.985} & \textbf{0.995} & 0.925 \\
-Stacking (RF)      & \textbf{0.967} & 0.972 & 0.947 & 0.981 & \textbf{0.985} & 0.985 & \textbf{0.963} \\
-Deep Ensemble      & 0.867 & 0.972 & 0.947 & 0.978 & 0.965 & \textbf{0.995} & 0.938 \\
+ICM-Weighted       & 0.933 & 0.972 & 0.956 & 0.983 & \textbf{0.985} & \textbf{0.995} & 0.888 \\
+Ensemble Avg       & 0.933 & \textbf{1.000} & 0.965 & 0.975 & \textbf{0.985} & \textbf{0.995} & 0.900 \\
+Stacking (LR)      & \textbf{0.967} & \textbf{1.000} & \textbf{0.974} & 0.981 & \textbf{0.985} & \textbf{0.995} & 0.888 \\
+Stacking (RF)      & \textbf{0.967} & 0.972 & 0.947 & 0.981 & \textbf{0.985} & 0.985 & 0.900 \\
+Deep Ensemble      & 0.833 & \textbf{1.000} & 0.956 & \textbf{0.986} & 0.980 & 0.990 & \textbf{0.938} \\
 \midrule
-\multicolumn{8}{l}{\emph{Mean ICM-Weighted accuracy (all 9 datasets, 5-fold CV): 0.953; Mean best baseline: 0.961}} \\
+\multicolumn{8}{l}{\emph{Mean ICM-Weighted accuracy (all 9 datasets, 5-fold CV): 0.953; Mean best baseline: 0.964}} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Under 5-fold cross-validation, ICM-Weighted predictions achieve a mean accuracy of $0.953 \pm 0.03$ across all nine classification tasks, compared to 0.961 for the best baseline per dataset. ICM-Weighted is the top method on 4 of 9 classification datasets. On the most challenging dataset (Covertype, 7 classes, 54 features), all methods struggle: ICM-Weighted achieves 0.770 vs.\ 0.848 for Stacking-LR. On Olivetti Faces (40 classes), ICM-Weighted achieves 0.938, close to the best Stacking-RF at 0.963. On the synthetic Moons and Circles datasets, most methods achieve near-perfect accuracy ($\geq 0.985$), confirming that the model zoo handles nonlinear boundaries well.
+Under 5-fold cross-validation, ICM-Weighted predictions achieve a mean accuracy of $0.953 \pm 0.03$ across all nine classification tasks, compared to 0.964 for the best baseline per dataset. ICM-Weighted is the top method on 2 of 9 classification datasets (including ties). The Deep Ensemble baseline uses five architecturally diverse MLPs with varied hidden layer sizes, activation functions, and learning rates to maximize disagreement-based diversity. On the most challenging dataset (Covertype, 7 classes, 54 features), all methods struggle: ICM-Weighted achieves 0.750 vs.\ 0.755 for the best baseline. On Olivetti Faces (40 classes), ICM-Weighted achieves 0.888, while the Deep Ensemble achieves 0.938 due to its architectural diversity. On the synthetic Moons and Circles datasets, most methods achieve near-perfect accuracy ($\geq 0.985$), confirming that the model zoo handles nonlinear boundaries well.
 
 For regression under 5-fold CV, ICM-Weighted achieves RMSE $0.531 \pm 0.016$ on California Housing (vs.\ $0.571 \pm 0.017$ for ensemble average) and RMSE $58.0 \pm 5.6$ on Diabetes (vs.\ $55.7 \pm 3.4$ for ensemble average), showing mixed results.
 

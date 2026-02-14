@@ -57,8 +57,8 @@ def conformalize(
     """Split-conformal calibration of the isotonic risk curve.
 
     Computes residuals r_i = L_i - g(C_i) on the calibration set and
-    returns g_alpha(c) = g(c) + q, where q is the ceil((1-alpha)(n+1)/n)-th
-    empirical quantile of the residuals.
+    returns g_alpha(c) = g(c) + q, where q is the ((1-alpha)(n+1))/n-th
+    empirical quantile of the residuals (using linear interpolation).
 
     Parameters
     ----------
@@ -80,7 +80,7 @@ def conformalize(
     L_cal = np.asarray(L_cal, dtype=float)
     residuals = L_cal - g_fitted.predict(C_cal)
     n = len(residuals)
-    quantile_level = np.ceil((1 - alpha) * (n + 1)) / n
+    quantile_level = (1 - alpha) * (n + 1) / n
     quantile_level = min(quantile_level, 1.0)
     q = float(np.quantile(residuals, quantile_level))
 
