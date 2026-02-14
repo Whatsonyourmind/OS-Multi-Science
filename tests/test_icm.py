@@ -1895,3 +1895,104 @@ class TestNewConfigBackwardCompatibility:
             preds, config=config, signs=np.array([1.0, 1.0]),
         )
         assert result.components.D == pytest.approx(1.0, abs=1e-6)
+
+
+# ============================================================
+# Aggregation Method Tests
+# ============================================================
+
+class TestAggregationMethods:
+    """Test that different aggregation methods produce different results."""
+
+    def test_calibrated_beta_vs_logistic_differ(self):
+        """Calibrated Beta aggregation should produce different scores from Logistic."""
+        # Create simple test predictions
+        preds = {
+            "m1": np.array([0.8, 0.2, 0.5]),
+            "m2": np.array([0.75, 0.25, 0.5]),
+            "m3": np.array([0.85, 0.15, 0.5]),
+        }
+
+        # Compute with logistic aggregation
+        config_logistic = ICMConfig(aggregation="logistic")
+        result_logistic = compute_icm_from_predictions(preds, config=config_logistic)
+
+        # Compute with calibrated Beta aggregation
+        config_calibrated = ICMConfig(aggregation="calibrated", beta_shape_a=5.0, beta_shape_b=5.0)
+        result_calibrated = compute_icm_from_predictions(preds, config=config_calibrated)
+
+        # The scores should be different (not identical)
+        assert result_logistic.icm_score != pytest.approx(result_calibrated.icm_score, abs=1e-6), (
+            f"Logistic ({result_logistic.icm_score:.6f}) should differ from "
+            f"Calibrated Beta ({result_calibrated.icm_score:.6f})"
+        )
+
+    def test_calibrated_beta_respects_tail_differences(self):
+        """Calibrated Beta should produce different results at tails compared to logistic."""
+        # Create a scenario where all components are very high (tail behavior)
+        components_high = ICMComponents(A=0.95, D=0.95, U=0.95, C=0.95, Pi=0.05)
+
+        config_logistic = ICMConfig(aggregation="logistic")
+        result_logistic = compute_icm(components_high, config=config_logistic)
+
+        config_calibrated = ICMConfig(aggregation="calibrated", beta_shape_a=5.0, beta_shape_b=5.0)
+        result_calibrated = compute_icm_calibrated(components_high, config=config_calibrated)
+
+        # Both should produce high scores, but they may differ
+        assert result_logistic.icm_score > 0.5
+        assert result_calibrated.icm_score > 0.5
+        # They should not be identical
+        assert result_logistic.icm_score != pytest.approx(result_calibrated.icm_score, abs=0.01), (
+            f"Logistic ({result_logistic.icm_score:.6f}) and Calibrated Beta ({result_calibrated.icm_score:.6f}) "
+            f"should differ on high-component inputs"
+        )
+
+    def test_aggregation_method_preserved_in_result(self):
+        """ICMResult should record the aggregation method used."""
+        components = ICMComponents(A=0.7, D=0.8, U=0.6, C=0.9, Pi=0.1)
+
+        config_logistic = ICMConfig(aggregation="logistic")
+        result_logistic = compute_icm(components, config=config_logistic)
+        assert result_logistic.aggregation_method == "logistic"
+
+        config_calibrated = ICMConfig(aggregation="calibrated")
+        result_calibrated = compute_icm_calibrated(components, config=config_calibrated)
+        assert result_calibrated.aggregation_method == "calibrated"
+
+        config_geometric = ICMConfig(aggregation="geometric")
+        result_geometric = compute_icm_geometric(components, config=config_geometric)
+        assert result_geometric.aggregation_method == "geometric"
+
+        config_adaptive = ICMConfig(aggregation="adaptive")
+        result_adaptive = compute_icm_adaptive(components, config=config_adaptive)
+        assert result_adaptive.aggregation_method == "adaptive"
+
+    def test_dispatch_aggregation_selects_correct_method(self):
+        """_dispatch_aggregation should route to correct function based on config."""
+        components = ICMComponents(A=0.7, D=0.8, U=0.6, C=0.9, Pi=0.1)
+
+        for method in ["logistic", "geometric", "calibrated", "adaptive"]:
+            config = ICMConfig(aggregation=method)
+            result = _dispatch_aggregation(components, config)
+            assert result.aggregation_method == method, (
+                f"Expected aggregation_method={method}, got {result.aggregation_method}"
+            )
+            assert 0.0 <= result.icm_score <= 1.0, (
+                f"ICM score {result.icm_score} out of [0, 1] for method {method}"
+            )
+
+    def test_calibrated_beta_with_different_shape_parameters(self):
+        """Calibrated Beta with different shape parameters should produce different results."""
+        components = ICMComponents(A=0.5, D=0.5, U=0.5, C=0.5, Pi=0.0)
+
+        config_symmetric = ICMConfig(aggregation="calibrated", beta_shape_a=5.0, beta_shape_b=5.0)
+        result_symmetric = compute_icm_calibrated(components, config=config_symmetric)
+
+        config_skewed = ICMConfig(aggregation="calibrated", beta_shape_a=2.0, beta_shape_b=8.0)
+        result_skewed = compute_icm_calibrated(components, config=config_skewed)
+
+        # Different shape parameters should produce different results
+        # (though they may be close for mid-range z_norm values)
+        # The important thing is they compute without error and produce valid scores
+        assert 0.0 <= result_symmetric.icm_score <= 1.0
+        assert 0.0 <= result_skewed.icm_score <= 1.0

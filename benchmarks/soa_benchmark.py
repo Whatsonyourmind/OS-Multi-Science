@@ -20,10 +20,14 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, wilcoxon
 
+from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.preprocessing import StandardScaler
+
 from benchmarks.datasets import (
     list_classification_datasets,
     list_regression_datasets,
     load_dataset,
+    load_dataset_full,
     get_dataset_info,
 )
 from benchmarks.model_zoo import (
@@ -308,6 +312,7 @@ def _compute_per_sample_icm_classification(
     np.ndarray of shape (n_samples,) with ICM scores in [0, 1].
     """
     from scipy.special import expit as _expit
+    from scipy.stats import beta as _scipy_beta
 
     model_names = sorted(predictions.keys())
     pred_arrays = [np.asarray(predictions[m], dtype=np.float64) for m in model_names]
@@ -403,7 +408,7 @@ def _compute_per_sample_icm_classification(
         # Pi: set to 0 -- no test labels used (avoids circularity)
         Pi = 0.0
 
-        # ICM aggregation
+        # ICM aggregation - respect config.aggregation setting
         z_raw = (
             config.w_A * A
             + config.w_D * D
@@ -411,8 +416,81 @@ def _compute_per_sample_icm_classification(
             + config.w_C * C_val
             - config.lam * Pi
         )
-        z = config.logistic_scale * (z_raw - config.logistic_shift)
-        icm_scores[i] = float(_expit(z))
+
+        # Apply aggregation method based on config
+        if config.aggregation == "logistic":
+            # Logistic sigmoid with scale and shift
+            z = config.logistic_scale * (z_raw - config.logistic_shift)
+            icm_scores[i] = float(_expit(z))
+        elif config.aggregation == "geometric":
+            # Geometric mean aggregation
+            eps = 1e-12
+            factors = [
+                (max(A, eps), config.w_A),
+                (max(D, eps), config.w_D),
+                (max(U, eps), config.w_U),
+                (max(C_val, eps), config.w_C),
+                (max(1.0 - Pi, eps), config.lam),
+            ]
+            total_w = sum(w for _, w in factors)
+            log_icm = sum(w / total_w * np.log(v) for v, w in factors)
+            icm_scores[i] = float(np.clip(np.exp(log_icm), 0.0, 1.0))
+        elif config.aggregation == "calibrated":
+            # Beta CDF aggregation
+            z_min = -config.lam
+            z_max = config.w_A + config.w_D + config.w_U + config.w_C
+            denom = z_max - z_min
+            if denom < 1e-12:
+                z_norm = 0.5
+            else:
+                z_norm = (z_raw - z_min) / denom
+            z_norm = float(np.clip(z_norm, 0.0, 1.0))
+            icm_scores[i] = float(_scipy_beta.cdf(z_norm, config.beta_shape_a, config.beta_shape_b))
+        elif config.aggregation == "adaptive":
+            # Adaptive percentile-based aggregation
+            # Use a default calibration set when not provided
+            cal_scores = config.adaptive_calibration_scores
+            if cal_scores is None or len(cal_scores) < 2:
+                # Generate default calibration scores
+                rng = np.random.default_rng(0)
+                n_cal_samples = 500
+                cal_scores = []
+                for _ in range(n_cal_samples):
+                    a = rng.uniform(0, 1)
+                    d = rng.uniform(0, 1)
+                    u = rng.uniform(0, 1)
+                    c = rng.uniform(0, 1)
+                    pi = rng.uniform(0, 1)
+                    s = (
+                        config.w_A * a
+                        + config.w_D * d
+                        + config.w_U * u
+                        + config.w_C * c
+                        - config.lam * pi
+                    )
+                    cal_scores.append(s)
+
+            sorted_cal = np.sort(cal_scores)
+            n_cal = len(sorted_cal)
+            idx = np.searchsorted(sorted_cal, z_raw, side="right")
+
+            if idx <= 0:
+                icm_scores[i] = 0.0
+            elif idx >= n_cal:
+                icm_scores[i] = 1.0
+            else:
+                lo = sorted_cal[idx - 1]
+                hi = sorted_cal[idx]
+                if hi - lo < 1e-12:
+                    icm_scores[i] = idx / n_cal
+                else:
+                    frac = (z_raw - lo) / (hi - lo)
+                    icm_scores[i] = (idx - 1 + frac) / n_cal
+            icm_scores[i] = float(np.clip(icm_scores[i], 0.0, 1.0))
+        else:
+            # Fallback to logistic if aggregation method is invalid
+            z = config.logistic_scale * (z_raw - config.logistic_shift)
+            icm_scores[i] = float(_expit(z))
 
     return icm_scores
 
@@ -564,16 +642,6 @@ def experiment_prediction_quality(
                 "brier_score": np.nan,
             })
 
-        # Bootstrap (use ensemble average for scoring)
-        be = BootstrapEnsemble(n_bootstrap=50)
-        be_result = be.uncertainty_vs_error(preds_test, y_test)
-        results_rows.append({
-            "method": "Bootstrap Ensemble",
-            "accuracy": ea_scores["accuracy"],  # Same as ensemble avg
-            "log_loss": ea_scores["log_loss"],
-            "brier_score": ea_scores["brier_score"],
-        })
-
         # Deep Ensemble (5 MLP members with different architectures)
         try:
             de = DeepEnsemble(n_members=5, max_iter=200, seed=seed)
@@ -688,22 +756,9 @@ def experiment_uncertainty_quantification(
 
     y_test_int = np.asarray(y_test, dtype=int)
 
-    # ICM-based prediction sets (no test labels for ICM computation)
-    per_sample_icm = _compute_per_sample_icm_classification(
-        preds_test, config,
-    )
-    icm_sets = _icm_prediction_sets_classification(
-        preds_test, per_sample_icm,
-        tau_hi=crc_config.tau_hi,
-        tau_lo=crc_config.tau_lo,
-    )
-
-    icm_coverage = sum(
-        1 for i, ps in enumerate(icm_sets) if y_test_int[i] in ps
-    ) / len(y_test_int)
-    icm_avg_size = float(np.mean([len(ps) for ps in icm_sets]))
-
-    # Split conformal baseline
+    # Split test set into calibration and evaluation subsets.
+    # Both ICM-CRC and Split Conformal are evaluated on the SAME
+    # evaluation subset (test_idx) for a fair comparison.
     avg_pred = _mean_proba(preds_test)
     n_test = len(y_test_int)
     n_cal = n_test // 2
@@ -712,6 +767,24 @@ def experiment_uncertainty_quantification(
     cal_idx = indices[:n_cal]
     test_idx = indices[n_cal:]
 
+    # --- ICM-based prediction sets on eval subset only ---
+    # Build per-model prediction dicts restricted to eval samples
+    eval_preds = {m: v[test_idx] for m, v in preds_test.items()}
+    per_sample_icm = _compute_per_sample_icm_classification(
+        eval_preds, config,
+    )
+    icm_sets = _icm_prediction_sets_classification(
+        eval_preds, per_sample_icm,
+        tau_hi=crc_config.tau_hi,
+        tau_lo=crc_config.tau_lo,
+    )
+
+    icm_coverage = sum(
+        1 for i, ps in enumerate(icm_sets) if y_test_int[test_idx[i]] in ps
+    ) / len(test_idx)
+    icm_avg_size = float(np.mean([len(ps) for ps in icm_sets]))
+
+    # --- Split conformal baseline on same eval subset ---
     sc = SplitConformal(alpha=crc_config.alpha)
     sc.calibrate(avg_pred[cal_idx], y_test_int[cal_idx])
     conformal_sets = sc.predict_sets(avg_pred[test_idx])
@@ -720,20 +793,17 @@ def experiment_uncertainty_quantification(
     ) / len(test_idx)
     conf_avg_size = float(np.mean([len(ps) for ps in conformal_sets]))
 
-    # Conditional coverage: per-class coverage
+    # Conditional coverage: per-class coverage on the SAME eval subset
     n_classes = avg_pred.shape[1] if avg_pred.ndim == 2 else 2
     icm_cond_cov = {}
     conf_cond_cov = {}
     for c in range(n_classes):
-        # ICM: full test set
-        mask_c = y_test_int == c
-        if mask_c.sum() > 0:
-            icm_cond_cov[c] = sum(
-                1 for i in range(n_test) if mask_c[i] and y_test_int[i] in icm_sets[i]
-            ) / mask_c.sum()
-        # Conformal: test subset only
         mask_c_sub = y_test_int[test_idx] == c
         if mask_c_sub.sum() > 0:
+            icm_cond_cov[c] = sum(
+                1 for i in range(len(test_idx))
+                if mask_c_sub[i] and y_test_int[test_idx[i]] in icm_sets[i]
+            ) / mask_c_sub.sum()
             conf_cond_cov[c] = sum(
                 1 for i in range(len(test_idx))
                 if mask_c_sub[i] and y_test_int[test_idx[i]] in conformal_sets[i]
@@ -1045,6 +1115,612 @@ def experiment_score_range(
 
 
 # ============================================================
+# Experiment 6: Ablation Study
+# ============================================================
+
+def experiment_ablation_study(
+    dataset_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    task: str,
+    seed: int = 42,
+    config: ICMConfig | None = None,
+    _preds_test: dict[str, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Run a comprehensive ablation study of ICM components.
+
+    For classification datasets, evaluates multiple variants of the ICM framework:
+    - Full ICM (all 5 components)
+    - ICM without each component (A, D, U, C, Pi)
+    - ICM with only A
+    - ICM with ensemble entropy only (as alternative signal)
+    - ICM with A+D only
+    - Random baseline
+
+    For each variant, computes:
+    - Spearman correlation between inverted signal and per-sample error
+    - Decision gate breakdown (ACT/DEFER/AUDIT percentages)
+    - Mean signal value
+
+    Returns
+    -------
+    dict with keys:
+        'results_table': pd.DataFrame with columns [Variant, Spearman Corr, ACT%, DEFER%, AUDIT%, Mean Score]
+        'ablation_details': dict mapping variant name to per-sample scores
+        'skip_reason': (for regression) reason dataset was skipped
+    """
+    if config is None:
+        config = ICMConfig.wide_range_preset()
+
+    if task != "classification":
+        return {
+            "results_table": pd.DataFrame(),
+            "ablation_details": {},
+            "skip_reason": "regression dataset",
+        }
+
+    if _preds_test is not None:
+        preds_test = _preds_test
+    else:
+        models = build_classification_zoo(seed=seed)
+        train_zoo(models, X_train, y_train)
+        preds_test = collect_predictions_classification(models, X_test)
+
+    y_test_int = np.asarray(y_test, dtype=int)
+    n_samples = y_test_int.shape[0]
+
+    # Compute per-sample error for correlation analysis
+    per_sample_error = _compute_per_sample_error_classification(preds_test, y_test_int)
+
+    results_rows = []
+    ablation_details = {}
+
+    # Use a small epsilon for "zero" weights (ICMConfig requires weights > 0)
+    epsilon = 1e-6
+
+    # ===== Variant 1: Full ICM (all 5 components) =====
+    variant_name = "Full ICM"
+    full_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=config.w_D,
+        w_U=config.w_U,
+        w_C=config.w_C,
+        lam=config.lam,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, full_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 2: ICM without A (set w_A to epsilon) =====
+    variant_name = "No A (w_A~0)"
+    no_a_config = ICMConfig(
+        w_A=epsilon,
+        w_D=config.w_D,
+        w_U=config.w_U,
+        w_C=config.w_C,
+        lam=config.lam,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, no_a_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 3: ICM without D (set w_D to epsilon) =====
+    variant_name = "No D (w_D~0)"
+    no_d_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=epsilon,
+        w_U=config.w_U,
+        w_C=config.w_C,
+        lam=config.lam,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, no_d_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 4: ICM without U (set w_U to epsilon) =====
+    variant_name = "No U (w_U~0)"
+    no_u_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=config.w_D,
+        w_U=epsilon,
+        w_C=config.w_C,
+        lam=config.lam,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, no_u_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 5: ICM without C (set w_C to epsilon) =====
+    variant_name = "No C (w_C~0)"
+    no_c_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=config.w_D,
+        w_U=config.w_U,
+        w_C=epsilon,
+        lam=config.lam,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, no_c_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 6: ICM with only A (all other weights to epsilon) =====
+    variant_name = "Only A"
+    only_a_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=epsilon,
+        w_U=epsilon,
+        w_C=epsilon,
+        lam=epsilon,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, only_a_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 7: Ensemble Entropy Only =====
+    variant_name = "Entropy Only"
+    entropy_scores = _ensemble_entropy(preds_test)
+    # Normalize entropy to [0, 1] (higher entropy = more uncertain)
+    entropy_norm = (entropy_scores - entropy_scores.min()) / (entropy_scores.max() - entropy_scores.min() + 1e-12)
+    ablation_details[variant_name] = entropy_norm
+    corr, pval = _compute_spearman_for_ablation(entropy_norm, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, entropy_norm, corr))
+
+    # ===== Variant 8: ICM with A+D only =====
+    variant_name = "A+D Only"
+    ad_config = ICMConfig(
+        w_A=config.w_A,
+        w_D=config.w_D,
+        w_U=epsilon,
+        w_C=epsilon,
+        lam=epsilon,
+        logistic_scale=config.logistic_scale,
+        logistic_shift=config.logistic_shift,
+        aggregation=config.aggregation,
+    )
+    scores = _compute_per_sample_icm_classification(preds_test, ad_config)
+    ablation_details[variant_name] = scores
+    corr, pval = _compute_spearman_for_ablation(1.0 - scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, scores, corr))
+
+    # ===== Variant 9: Random Baseline =====
+    variant_name = "Random Baseline"
+    rng = np.random.default_rng(seed)
+    random_scores = rng.uniform(0, 1, n_samples)
+    ablation_details[variant_name] = random_scores
+    corr, pval = _compute_spearman_for_ablation(random_scores, per_sample_error)
+    results_rows.append(_ablation_row(variant_name, random_scores, corr))
+
+    return {
+        "results_table": pd.DataFrame(results_rows),
+        "ablation_details": ablation_details,
+    }
+
+
+def _compute_spearman_for_ablation(
+    signal: np.ndarray,
+    per_sample_error: np.ndarray,
+) -> tuple[float, float]:
+    """Compute Spearman correlation, handling edge cases."""
+    if np.std(signal) > 1e-12 and np.std(per_sample_error) > 1e-12:
+        corr, pval = spearmanr(signal, per_sample_error)
+        return float(corr), float(pval)
+    else:
+        return 0.0, 1.0
+
+
+def _ablation_row(
+    variant_name: str,
+    scores: np.ndarray,
+    spearman_corr: float,
+) -> dict[str, Any]:
+    """Create a row for the ablation study results table."""
+    n_act = int(np.sum(scores >= 0.7))
+    n_defer = int(np.sum((scores >= 0.3) & (scores < 0.7)))
+    n_audit = int(np.sum(scores < 0.3))
+    total = len(scores)
+
+    return {
+        "Variant": variant_name,
+        "Spearman Corr": float(spearman_corr),
+        "ACT%": f"{100 * n_act / total:.1f}" if total > 0 else "0",
+        "DEFER%": f"{100 * n_defer / total:.1f}" if total > 0 else "0",
+        "AUDIT%": f"{100 * n_audit / total:.1f}" if total > 0 else "0",
+        "Mean Score": float(np.mean(scores)),
+    }
+
+
+# ============================================================
+
+
+# ============================================================
+# Experiment 7: Dependency Penalty (Pi > 0)
+# ============================================================
+
+def experiment_dependency_penalty(
+    dataset_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    task: str,
+    seed: int = 42,
+    config: ICMConfig | None = None,
+    _preds_train: dict[str, np.ndarray] | None = None,
+    _preds_test: dict[str, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Demonstrate the dependency penalty Pi in action.
+
+    This experiment activates Pi by providing training residuals to the ICM.
+    It compares:
+    1. Diverse ensemble WITHOUT Pi (Pi=0)
+    2. Diverse ensemble WITH Pi (using training residuals)
+    3. Correlated ensemble WITH Pi (should be heavily penalized)
+
+    The correlated ensemble is created by taking the first model's predictions
+    and creating copies with small noise, making it highly dependent.
+
+    For each scenario, shows:
+    - ICM Score (aggregated across samples)
+    - Pi Value (averaged dependency penalty)
+    - Individual components: A (Agreement), D (Direction), U (Uncertainty), C (Invariance)
+
+    Key observation: The correlated ensemble should have HIGHER Pi (more negative
+    penalty) and thus LOWER final ICM score compared to the diverse ensemble.
+
+    Returns
+    -------
+    dict with keys:
+        'results_table': pd.DataFrame with columns [Scenario, ICM Score, Pi Value, A, D, U, C]
+        'icm_no_pi': ICM result object without Pi
+        'icm_with_pi': ICM result object with Pi (diverse)
+        'icm_corr': ICM result object with Pi (correlated, penalized)
+        'preds_train': training predictions dict
+        'preds_test': test predictions dict
+        'corr_preds': correlated test predictions dict
+        'skip_reason': (for regression only) reason dataset was skipped
+    """
+    if config is None:
+        config = ICMConfig.wide_range_preset()
+
+    if task != "classification":
+        return {
+            "results_table": pd.DataFrame(),
+            "skip_reason": "regression dataset",
+        }
+
+    if _preds_train is not None and _preds_test is not None:
+        preds_train = _preds_train
+        preds_test = _preds_test
+    else:
+        models = build_classification_zoo(seed=seed)
+        train_zoo(models, X_train, y_train)
+        preds_train = collect_predictions_classification(models, X_train)
+        preds_test = collect_predictions_classification(models, X_test)
+
+    # ================================================================
+    # Scenario 1: Diverse ensemble WITHOUT Pi (Pi=0, no residuals)
+    # ================================================================
+    icm_result_no_pi = compute_icm_from_predictions(
+        preds_test, config=config, y_true=None, residuals=None,
+    )
+    comps_no_pi = icm_result_no_pi.components
+
+    # ================================================================
+    # Scenario 2: Diverse ensemble WITH Pi (using training residuals)
+    # ================================================================
+    train_residuals = _compute_training_residuals_classification(
+        preds_train, y_train,
+    )
+    icm_result_with_pi = compute_icm_from_predictions(
+        preds_test, config=config, y_true=None, residuals=train_residuals,
+    )
+    comps_with_pi = icm_result_with_pi.components
+
+    # ================================================================
+    # Scenario 3: Correlated ensemble WITH Pi
+    # ================================================================
+    # Create correlated predictions: take first model and create noisy copies
+    rng = np.random.default_rng(seed)
+    model_names = sorted(preds_test.keys())
+    first_model = model_names[0]
+    first_preds = np.asarray(preds_test[first_model], dtype=np.float64)
+
+    # Create 3 correlated copies with small noise
+    corr_preds = {}
+    for i in range(3):
+        model_name = f"corr_model_{i}"
+        noise = rng.normal(0, 0.02, size=first_preds.shape)
+        noisy_copy = np.clip(first_preds + noise, 0.0, 1.0)
+        # Renormalize if it's a probability distribution
+        if first_preds.ndim == 2 and first_preds.shape[1] > 1:
+            row_sums = noisy_copy.sum(axis=1, keepdims=True)
+            noisy_copy = noisy_copy / (row_sums + 1e-12)
+        corr_preds[model_name] = noisy_copy
+
+    # Compute training residuals for the correlated ensemble
+    # Need to create corresponding training predictions
+    corr_preds_train = {}
+    first_preds_train = np.asarray(preds_train[first_model], dtype=np.float64)
+    for i in range(3):
+        model_name = f"corr_model_{i}"
+        noise = rng.normal(0, 0.02, size=first_preds_train.shape)
+        noisy_copy = np.clip(first_preds_train + noise, 0.0, 1.0)
+        if first_preds_train.ndim == 2 and first_preds_train.shape[1] > 1:
+            row_sums = noisy_copy.sum(axis=1, keepdims=True)
+            noisy_copy = noisy_copy / (row_sums + 1e-12)
+        corr_preds_train[model_name] = noisy_copy
+
+    corr_train_residuals = _compute_training_residuals_classification(
+        corr_preds_train, y_train,
+    )
+    icm_result_corr = compute_icm_from_predictions(
+        corr_preds, config=config, y_true=None, residuals=corr_train_residuals,
+    )
+    comps_corr = icm_result_corr.components
+
+    # ================================================================
+    # Build results table
+    # ================================================================
+    results_rows = [
+        {
+            "Scenario": "Diverse Ensemble (no Pi)",
+            "ICM Score": icm_result_no_pi.icm_score,
+            "Pi Value": comps_no_pi.Pi,
+            "A": comps_no_pi.A,
+            "D": comps_no_pi.D,
+            "U": comps_no_pi.U,
+            "C": comps_no_pi.C,
+        },
+        {
+            "Scenario": "Diverse Ensemble (with Pi)",
+            "ICM Score": icm_result_with_pi.icm_score,
+            "Pi Value": comps_with_pi.Pi,
+            "A": comps_with_pi.A,
+            "D": comps_with_pi.D,
+            "U": comps_with_pi.U,
+            "C": comps_with_pi.C,
+        },
+        {
+            "Scenario": "Correlated Ensemble (with Pi)",
+            "ICM Score": icm_result_corr.icm_score,
+            "Pi Value": comps_corr.Pi,
+            "A": comps_corr.A,
+            "D": comps_corr.D,
+            "U": comps_corr.U,
+            "C": comps_corr.C,
+        },
+    ]
+
+    results_df = pd.DataFrame(results_rows)
+
+    return {
+        "results_table": results_df,
+        "icm_no_pi": icm_result_no_pi,
+        "icm_with_pi": icm_result_with_pi,
+        "icm_corr": icm_result_corr,
+        "preds_train": preds_train,
+        "preds_test": preds_test,
+        "corr_preds": corr_preds,
+    }
+
+
+# ============================================================
+# Experiment 8: Decision Gating Comparison
+# ============================================================
+
+def experiment_gating_comparison(
+    dataset_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    task: str,
+    seed: int = 42,
+    config: ICMConfig | None = None,
+    _preds_test: dict[str, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Compare ICM-based decision gating vs entropy-based gating.
+
+    Addresses Reviewer 3 question: "Would a simple linear combination of entropy
+    and disagreement work equally well for gating?"
+
+    For classification datasets, computes gating using 4 different signals:
+    a) ICM (wide-range): per-sample ICM scores
+    b) Entropy only: normalized ensemble entropy inverted for confidence
+    c) Max-prob confidence: max probability from ensemble average
+    d) Entropy + Disagreement: linear combination (0.5 * confidence + 0.5 * agreement)
+
+    For each signal, applies thresholds (tau_hi=0.7, tau_lo=0.3) to partition into:
+    - ACT: signal >= 0.7 (high confidence - should have high accuracy)
+    - DEFER: 0.3 <= signal < 0.7 (medium confidence)
+    - AUDIT: signal < 0.3 (low confidence - should flag hard samples)
+
+    For each gating method, computes:
+    - ACT%: percentage of samples in ACT partition
+    - ACT Accuracy: accuracy on ACT samples only
+    - AUDIT%: percentage of samples in AUDIT partition
+    - AUDIT Error Rate: error rate on AUDIT samples
+    - Gating Quality: ACT_accuracy - (1 - AUDIT_error_rate) [measures separation]
+
+    Returns
+    -------
+    dict with keys:
+        'results_table': pd.DataFrame with columns [Method, ACT%, ACT Accuracy, AUDIT%, AUDIT Error Rate, Gating Quality]
+        'per_sample_signals': dict mapping method name to per-sample signal arrays
+        'skip_reason': (for regression) reason dataset was skipped
+    """
+    if config is None:
+        config = ICMConfig.wide_range_preset()
+
+    # Skip for regression
+    if task != "classification":
+        return {
+            "results_table": pd.DataFrame(),
+            "per_sample_signals": {},
+            "skip_reason": "regression dataset",
+        }
+
+    # Get predictions
+    if _preds_test is not None:
+        preds_test = _preds_test
+    else:
+        models = build_classification_zoo(seed=seed)
+        train_zoo(models, X_train, y_train)
+        preds_test = collect_predictions_classification(models, X_test)
+
+    y_test_int = np.asarray(y_test, dtype=int)
+    n_samples = y_test_int.shape[0]
+    tau_hi = 0.7
+    tau_lo = 0.3
+
+    # Get average predictions for ACT accuracy computation
+    avg_pred = _mean_proba(preds_test)
+    if avg_pred.ndim == 1:
+        avg_pred = np.column_stack([1.0 - avg_pred, avg_pred])
+    pred_class = np.argmax(avg_pred, axis=1)
+    per_sample_accuracy = (pred_class == y_test_int).astype(float)
+
+    results_rows = []
+    per_sample_signals = {}
+
+    # ===== Method 1: ICM (wide-range) =====
+    method_name = "ICM (wide-range)"
+    icm_signal = _compute_per_sample_icm_classification(preds_test, config)
+    per_sample_signals[method_name] = icm_signal
+
+    act_mask = icm_signal >= tau_hi
+    audit_mask = icm_signal < tau_lo
+
+    act_pct = 100.0 * np.sum(act_mask) / n_samples if n_samples > 0 else 0.0
+    act_acc = float(np.mean(per_sample_accuracy[act_mask])) if np.sum(act_mask) > 0 else np.nan
+    audit_pct = 100.0 * np.sum(audit_mask) / n_samples if n_samples > 0 else 0.0
+    audit_error_rate = float(1.0 - np.mean(per_sample_accuracy[audit_mask])) if np.sum(audit_mask) > 0 else np.nan
+    gating_quality = float(act_acc - (1.0 - audit_error_rate)) if (not np.isnan(act_acc) and not np.isnan(audit_error_rate)) else np.nan
+
+    results_rows.append({
+        "Method": method_name,
+        "ACT%": float(act_pct),
+        "ACT Accuracy": act_acc,
+        "AUDIT%": float(audit_pct),
+        "AUDIT Error Rate": audit_error_rate,
+        "Gating Quality": gating_quality,
+    })
+
+    # ===== Method 2: Entropy Only =====
+    method_name = "Entropy Only"
+    entropy_scores = _ensemble_entropy(preds_test)
+    n_classes = avg_pred.shape[1]
+    normalized_entropy = entropy_scores / (np.log(n_classes) + 1e-12)
+    normalized_entropy = np.clip(normalized_entropy, 0.0, 1.0)
+    entropy_confidence = 1.0 - normalized_entropy  # Invert: higher = more confident
+    per_sample_signals[method_name] = entropy_confidence
+
+    act_mask = entropy_confidence >= tau_hi
+    audit_mask = entropy_confidence < tau_lo
+
+    act_pct = 100.0 * np.sum(act_mask) / n_samples if n_samples > 0 else 0.0
+    act_acc = float(np.mean(per_sample_accuracy[act_mask])) if np.sum(act_mask) > 0 else np.nan
+    audit_pct = 100.0 * np.sum(audit_mask) / n_samples if n_samples > 0 else 0.0
+    audit_error_rate = float(1.0 - np.mean(per_sample_accuracy[audit_mask])) if np.sum(audit_mask) > 0 else np.nan
+    gating_quality = float(act_acc - (1.0 - audit_error_rate)) if (not np.isnan(act_acc) and not np.isnan(audit_error_rate)) else np.nan
+
+    results_rows.append({
+        "Method": method_name,
+        "ACT%": float(act_pct),
+        "ACT Accuracy": act_acc,
+        "AUDIT%": float(audit_pct),
+        "AUDIT Error Rate": audit_error_rate,
+        "Gating Quality": gating_quality,
+    })
+
+    # ===== Method 3: Max-Prob Confidence =====
+    method_name = "Max-Prob Confidence"
+    max_prob = np.max(avg_pred, axis=1)
+    per_sample_signals[method_name] = max_prob
+
+    act_mask = max_prob >= tau_hi
+    audit_mask = max_prob < tau_lo
+
+    act_pct = 100.0 * np.sum(act_mask) / n_samples if n_samples > 0 else 0.0
+    act_acc = float(np.mean(per_sample_accuracy[act_mask])) if np.sum(act_mask) > 0 else np.nan
+    audit_pct = 100.0 * np.sum(audit_mask) / n_samples if n_samples > 0 else 0.0
+    audit_error_rate = float(1.0 - np.mean(per_sample_accuracy[audit_mask])) if np.sum(audit_mask) > 0 else np.nan
+    gating_quality = float(act_acc - (1.0 - audit_error_rate)) if (not np.isnan(act_acc) and not np.isnan(audit_error_rate)) else np.nan
+
+    results_rows.append({
+        "Method": method_name,
+        "ACT%": float(act_pct),
+        "ACT Accuracy": act_acc,
+        "AUDIT%": float(audit_pct),
+        "AUDIT Error Rate": audit_error_rate,
+        "Gating Quality": gating_quality,
+    })
+
+    # ===== Method 4: Entropy + Disagreement (Linear Combination) =====
+    method_name = "Entropy + Disagreement"
+
+    # Compute bootstrap disagreement
+    be = BootstrapEnsemble(n_bootstrap=50)
+    boot_disagree = be.compute_disagreement(preds_test)
+    # Normalize disagreement to [0, 1]
+    disagreement_norm = (boot_disagree - boot_disagree.min()) / (boot_disagree.max() - boot_disagree.min() + 1e-12)
+    # Invert: higher disagreement = lower agreement confidence
+    agreement_confidence = 1.0 - disagreement_norm
+
+    # Linear combination: 0.5 * entropy_confidence + 0.5 * agreement_confidence
+    combined_signal = 0.5 * entropy_confidence + 0.5 * agreement_confidence
+    per_sample_signals[method_name] = combined_signal
+
+    act_mask = combined_signal >= tau_hi
+    audit_mask = combined_signal < tau_lo
+
+    act_pct = 100.0 * np.sum(act_mask) / n_samples if n_samples > 0 else 0.0
+    act_acc = float(np.mean(per_sample_accuracy[act_mask])) if np.sum(act_mask) > 0 else np.nan
+    audit_pct = 100.0 * np.sum(audit_mask) / n_samples if n_samples > 0 else 0.0
+    audit_error_rate = float(1.0 - np.mean(per_sample_accuracy[audit_mask])) if np.sum(audit_mask) > 0 else np.nan
+    gating_quality = float(act_acc - (1.0 - audit_error_rate)) if (not np.isnan(act_acc) and not np.isnan(audit_error_rate)) else np.nan
+
+    results_rows.append({
+        "Method": method_name,
+        "ACT%": float(act_pct),
+        "ACT Accuracy": act_acc,
+        "AUDIT%": float(audit_pct),
+        "AUDIT Error Rate": audit_error_rate,
+        "Gating Quality": gating_quality,
+    })
+
+    return {
+        "results_table": pd.DataFrame(results_rows),
+        "per_sample_signals": per_sample_signals,
+    }
+
+
 # Main Benchmark Runner
 # ============================================================
 
@@ -1159,6 +1835,38 @@ def run_soa_benchmark(seed: int = 42, verbose: bool = True) -> dict:
             print(exp5["results_table"].to_string(index=False))
             print()
 
+        # Experiment 6 (Ablation Study)
+        exp6 = experiment_ablation_study(
+            ds_name, X_train, X_test, y_train, y_test,
+            task="classification", seed=seed, config=config,
+            _preds_test=preds_test,
+        )
+        if verbose:
+            print("  Exp 6 (Ablation Study):")
+            print(exp6["results_table"].to_string(index=False))
+            print()
+
+        # Experiment 7 (Dependency Penalty Pi > 0)
+        exp7 = experiment_dependency_penalty(
+            ds_name, X_train, X_test, y_train, y_test,
+            task="classification", seed=seed, config=config,
+            _preds_train=preds_train, _preds_test=preds_test,
+        )
+        if verbose:
+            print("  Exp 7 (Dependency Penalty):")
+            print(exp7["results_table"].to_string(index=False))
+            print()
+
+        exp8 = experiment_gating_comparison(
+            ds_name, X_train, X_test, y_train, y_test,
+            task="classification", seed=seed, config=config,
+            _preds_test=preds_test,
+        )
+        if verbose:
+            print("  Exp 8 (Gating Comparison):")
+            print(exp8["results_table"].to_string(index=False))
+            print()
+
         dataset_results[ds_name] = {
             "info": info,
             "exp1_prediction_quality": exp1,
@@ -1166,6 +1874,9 @@ def run_soa_benchmark(seed: int = 42, verbose: bool = True) -> dict:
             "exp3_error_detection": exp3,
             "exp4_diversity": exp4,
             "exp5_score_range": exp5,
+            "exp6_ablation": exp6,
+            "exp7_dependency_penalty": exp7,
+            "exp8_gating_comparison": exp8,
         }
 
     # ------------------------------------------------------------------
@@ -1476,8 +2187,18 @@ def _write_report(
     icm_analysis: dict,
     summary: str,
     elapsed: float,
+    cv_results: dict | None = None,
 ) -> None:
-    """Write the benchmark report to reports/soa_benchmark_results.md."""
+    """Write the benchmark report to reports/soa_benchmark_results.md.
+
+    Parameters
+    ----------
+    cv_results : dict, optional
+        If provided, appends a cross-validation section to the report.
+        Expected keys: ``'cv_summary_tables'`` mapping dataset names to
+        DataFrames of mean +/- std metrics across folds, and
+        ``'n_folds'`` (int).
+    """
     reports_dir = Path(__file__).resolve().parent.parent / "reports"
     reports_dir.mkdir(exist_ok=True)
     report_path = reports_dir / "soa_benchmark_results.md"
@@ -1549,6 +2270,14 @@ def _write_report(
             lines.append(exp5["results_table"].to_markdown(index=False))
             lines.append("")
 
+        # Exp 6
+        exp6 = ds_data.get("exp6_ablation", {})
+        if "results_table" in exp6 and not exp6["results_table"].empty:
+            lines.append("#### Experiment 6: Ablation Study")
+            lines.append("")
+            lines.append(exp6["results_table"].to_markdown(index=False))
+            lines.append("")
+
         lines.append("---")
         lines.append("")
 
@@ -1574,6 +2303,24 @@ def _write_report(
     lines.append("## Statistical Analysis")
     lines.append("")
     _append_statistical_tests(lines, dataset_results, aggregate)
+
+    # Cross-validation results (optional)
+    if cv_results is not None:
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("## Cross-Validation Results")
+        lines.append("")
+        n_folds = cv_results.get("n_folds", 5)
+        lines.append(f"Results aggregated across {n_folds} folds (mean +/- std, 95% CI).")
+        lines.append("")
+        cv_tables = cv_results.get("cv_summary_tables", {})
+        for ds_name, tbl in cv_tables.items():
+            lines.append(f"### {ds_name}")
+            lines.append("")
+            if isinstance(tbl, pd.DataFrame) and not tbl.empty:
+                lines.append(tbl.to_markdown(index=False))
+            lines.append("")
 
     lines.append("")
     lines.append("---")
@@ -1610,13 +2357,13 @@ def _append_statistical_tests(
         diffs = np.array(icm_accs) - np.array(avg_accs)
         if np.any(diffs != 0):
             try:
-                stat, p = wilcoxon(diffs, alternative="greater")
+                stat, p = wilcoxon(diffs)  # two-sided
                 lines.append(
                     f"Wilcoxon signed-rank test (ICM-Weighted vs Ensemble Avg accuracy):"
                 )
                 lines.append(f"  statistic={stat:.4f}, p-value={p:.4f}")
                 if p < 0.05:
-                    lines.append("  Result: ICM-Weighted is significantly better (p < 0.05).")
+                    lines.append("  Result: Significant difference at p < 0.05.")
                 else:
                     lines.append("  Result: No significant difference at p < 0.05.")
             except ValueError:
@@ -1644,8 +2391,537 @@ def _append_statistical_tests(
 
 
 # ============================================================
+# Cross-Validation Benchmark Runner
+# ============================================================
+
+def run_soa_benchmark_cv(
+    seed: int = 42,
+    n_folds: int = 5,
+    verbose: bool = True,
+) -> dict:
+    """Run the full SOA benchmark with k-fold cross-validation.
+
+    For each dataset (except concept_drift which uses its own custom
+    train/test generator), performs stratified k-fold CV for classification
+    or standard k-fold for regression.  Each experiment is run on every
+    fold and results are aggregated as mean +/- std with 95% CI.
+
+    The concept_drift dataset is handled with its existing custom loader
+    using the same seed per fold (it generates its own train/test split
+    from different distributions).
+
+    Parameters
+    ----------
+    seed : int
+        Random seed for reproducibility.
+    n_folds : int
+        Number of cross-validation folds (default 5).
+    verbose : bool
+        If True, print progress and results to stdout.
+
+    Returns
+    -------
+    dict with keys:
+        'dataset_results' : per-dataset single-split results (from fold 0)
+        'cv_fold_results' : per-dataset, per-fold raw results
+        'cv_summary'      : per-dataset aggregated mean +/- std tables
+        'cv_summary_tables' : per-dataset summary DataFrames
+        'aggregate_results' : aggregated metrics across datasets (from fold 0)
+        'icm_analysis'      : ICM-specific analyses (from fold 0)
+        'summary'           : text summary
+        'elapsed_seconds'   : total runtime
+        'n_folds'           : number of folds used
+    """
+    start_time = time.time()
+    np.random.seed(seed)
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    config = ICMConfig.wide_range_preset()
+    crc_config = CRCConfig()
+
+    clf_datasets = list_classification_datasets()
+    reg_datasets = list_regression_datasets()
+
+    # Storage for all fold results and the "primary" single-split results
+    cv_fold_results: dict[str, list[dict]] = {}
+    cv_summary_tables: dict[str, pd.DataFrame] = {}
+    dataset_results: dict[str, dict] = {}  # fold-0 results for backward compat
+
+    if verbose:
+        print("=" * 72)
+        print("OS MULTI-SCIENCE: STATE-OF-THE-ART BENCHMARK (CROSS-VALIDATION)")
+        print(f"  Folds: {n_folds}, Seed: {seed}")
+        print("=" * 72)
+        print()
+
+    # ------------------------------------------------------------------
+    # Classification datasets
+    # ------------------------------------------------------------------
+    for ds_name in clf_datasets:
+        info = get_dataset_info(ds_name)
+        if verbose:
+            print(f"--- Dataset: {ds_name} ({info['description']}) ---")
+
+        # concept_drift uses a custom loader with shifted test distribution;
+        # standard k-fold doesn't apply.  Run it n_folds times with the
+        # same custom loader (varying the seed slightly per fold).
+        is_concept_drift = (ds_name == "concept_drift")
+
+        if is_concept_drift:
+            fold_results_list = []
+            for fold_i in range(n_folds):
+                fold_seed = seed + fold_i
+                X_train, X_test, y_train, y_test = load_dataset(
+                    ds_name, seed=fold_seed,
+                )
+                fold_res = _run_single_fold_classification(
+                    ds_name, X_train, X_test, y_train, y_test,
+                    seed=fold_seed, config=config, crc_config=crc_config,
+                    info=info, verbose=verbose, fold_i=fold_i,
+                )
+                fold_results_list.append(fold_res)
+                if fold_i == 0:
+                    dataset_results[ds_name] = fold_res
+        else:
+            # Standard k-fold CV
+            X_full, y_full, _, pca_components = load_dataset_full(ds_name)
+            skf = StratifiedKFold(
+                n_splits=n_folds, shuffle=True, random_state=seed,
+            )
+            fold_results_list = []
+            for fold_i, (train_idx, test_idx) in enumerate(skf.split(X_full, y_full)):
+                X_train_raw, X_test_raw = X_full[train_idx], X_full[test_idx]
+                y_train_fold, y_test_fold = y_full[train_idx], y_full[test_idx]
+
+                # PCA per-fold (fit on train only to prevent leakage)
+                if pca_components is not None:
+                    from sklearn.decomposition import PCA
+                    pca = PCA(n_components=pca_components, random_state=seed)
+                    X_train_raw = pca.fit_transform(X_train_raw)
+                    X_test_raw = pca.transform(X_test_raw)
+
+                # Standardize per-fold (fit on train only)
+                scaler = StandardScaler()
+                X_train_fold = scaler.fit_transform(X_train_raw)
+                X_test_fold = scaler.transform(X_test_raw)
+
+                fold_res = _run_single_fold_classification(
+                    ds_name, X_train_fold, X_test_fold,
+                    y_train_fold, y_test_fold,
+                    seed=seed, config=config, crc_config=crc_config,
+                    info=info, verbose=verbose, fold_i=fold_i,
+                )
+                fold_results_list.append(fold_res)
+                if fold_i == 0:
+                    dataset_results[ds_name] = fold_res
+
+        cv_fold_results[ds_name] = fold_results_list
+        summary_tbl = _aggregate_fold_results_classification(
+            fold_results_list, n_folds,
+        )
+        cv_summary_tables[ds_name] = summary_tbl
+        if verbose:
+            print(f"  CV Summary ({n_folds}-fold):")
+            print(summary_tbl.to_string(index=False))
+            print()
+
+    # ------------------------------------------------------------------
+    # Regression datasets
+    # ------------------------------------------------------------------
+    for ds_name in reg_datasets:
+        info = get_dataset_info(ds_name)
+        if verbose:
+            print(f"--- Dataset: {ds_name} ({info['description']}) ---")
+
+        X_full, y_full, _, pca_components = load_dataset_full(ds_name)
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+        fold_results_list = []
+        for fold_i, (train_idx, test_idx) in enumerate(kf.split(X_full, y_full)):
+            X_train_raw, X_test_raw = X_full[train_idx], X_full[test_idx]
+            y_train_fold, y_test_fold = y_full[train_idx], y_full[test_idx]
+
+            # PCA per-fold if needed (fit on train only)
+            if pca_components is not None:
+                from sklearn.decomposition import PCA
+                pca = PCA(n_components=pca_components, random_state=seed)
+                X_train_raw = pca.fit_transform(X_train_raw)
+                X_test_raw = pca.transform(X_test_raw)
+
+            scaler = StandardScaler()
+            X_train_fold = scaler.fit_transform(X_train_raw)
+            X_test_fold = scaler.transform(X_test_raw)
+
+            fold_res = _run_single_fold_regression(
+                ds_name, X_train_fold, X_test_fold,
+                y_train_fold, y_test_fold,
+                seed=seed, config=config, info=info,
+                verbose=verbose, fold_i=fold_i,
+            )
+            fold_results_list.append(fold_res)
+            if fold_i == 0:
+                dataset_results[ds_name] = fold_res
+
+        cv_fold_results[ds_name] = fold_results_list
+        summary_tbl = _aggregate_fold_results_regression(
+            fold_results_list, n_folds,
+        )
+        cv_summary_tables[ds_name] = summary_tbl
+        if verbose:
+            print(f"  CV Summary ({n_folds}-fold):")
+            print(summary_tbl.to_string(index=False))
+            print()
+
+    # ------------------------------------------------------------------
+    # Aggregate results (from fold-0 for backward compatibility)
+    # ------------------------------------------------------------------
+    aggregate = _compute_aggregate_results(dataset_results, clf_datasets)
+    icm_analysis = _compute_icm_analysis(dataset_results, clf_datasets)
+
+    elapsed = time.time() - start_time
+    summary_text = _build_summary(dataset_results, aggregate, icm_analysis, elapsed)
+
+    if verbose:
+        print("=" * 72)
+        print("SUMMARY")
+        print("=" * 72)
+        print(summary_text)
+
+    # Write report with CV results
+    _write_report(
+        dataset_results, aggregate, icm_analysis, summary_text, elapsed,
+        cv_results={
+            "cv_summary_tables": cv_summary_tables,
+            "n_folds": n_folds,
+        },
+    )
+
+    return {
+        "dataset_results": dataset_results,
+        "cv_fold_results": cv_fold_results,
+        "cv_summary": cv_summary_tables,
+        "cv_summary_tables": cv_summary_tables,
+        "aggregate_results": aggregate,
+        "icm_analysis": icm_analysis,
+        "summary": summary_text,
+        "elapsed_seconds": elapsed,
+        "n_folds": n_folds,
+    }
+
+
+def _run_single_fold_classification(
+    ds_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    *,
+    seed: int,
+    config: ICMConfig,
+    crc_config: CRCConfig,
+    info: dict,
+    verbose: bool,
+    fold_i: int,
+) -> dict:
+    """Run all classification experiments for a single fold.
+
+    Returns the same structure as the per-dataset entry in
+    ``run_soa_benchmark``'s ``dataset_results``.
+    """
+    clf_models = build_classification_zoo(seed=seed)
+    train_zoo(clf_models, X_train, y_train)
+    preds_train = collect_predictions_classification(clf_models, X_train)
+    preds_test = collect_predictions_classification(clf_models, X_test)
+
+    exp1 = experiment_prediction_quality(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_train=preds_train, _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 1 (Prediction Quality):")
+        print(exp1["results_table"].to_string(index=False))
+        print()
+
+    exp2 = experiment_uncertainty_quantification(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        crc_config=crc_config, _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 2 (Uncertainty Quantification):")
+        print(exp2["results_table"].to_string(index=False))
+        print()
+
+    exp3 = experiment_error_detection(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 3 (Error Detection):")
+        print(exp3["results_table"].to_string(index=False))
+        print()
+
+    exp4 = experiment_diversity_assessment(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 4 (Diversity Assessment):")
+        print(exp4["results_table"].to_string(index=False))
+        print()
+
+    exp5 = experiment_score_range(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 5 (Score Range):")
+        print(exp5["results_table"].to_string(index=False))
+        print()
+
+    exp6 = experiment_ablation_study(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 6 (Ablation Study):")
+        print(exp6["results_table"].to_string(index=False))
+        print()
+
+    exp7 = experiment_dependency_penalty(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_train=preds_train, _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 7 (Dependency Penalty):")
+        print(exp7["results_table"].to_string(index=False))
+        print()
+
+    exp8 = experiment_gating_comparison(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 8 (Gating Comparison):")
+        print(exp8["results_table"].to_string(index=False))
+        print()
+
+    return {
+        "info": info,
+        "exp1_prediction_quality": exp1,
+        "exp2_uncertainty": exp2,
+        "exp3_error_detection": exp3,
+        "exp4_diversity": exp4,
+        "exp5_score_range": exp5,
+        "exp6_ablation": exp6,
+        "exp7_dependency_penalty": exp7,
+        "exp8_gating_comparison": exp8,
+    }
+
+
+def _run_single_fold_regression(
+    ds_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    *,
+    seed: int,
+    config: ICMConfig,
+    info: dict,
+    verbose: bool,
+    fold_i: int,
+) -> dict:
+    """Run regression experiments for a single fold."""
+    reg_models = build_regression_zoo(seed=seed)
+    train_zoo(reg_models, X_train, y_train)
+    reg_preds_train = collect_predictions_regression(reg_models, X_train)
+    reg_preds_test = collect_predictions_regression(reg_models, X_test)
+
+    exp1 = experiment_prediction_quality(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="regression", seed=seed, config=config,
+        _preds_train=reg_preds_train, _preds_test=reg_preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 1 (Prediction Quality - Regression):")
+        print(exp1["results_table"].to_string(index=False))
+        print()
+
+    return {
+        "info": info,
+        "exp1_prediction_quality": exp1,
+    }
+
+
+def _aggregate_fold_results_classification(
+    fold_results: list[dict],
+    n_folds: int,
+) -> pd.DataFrame:
+    """Aggregate classification experiment results across folds.
+
+    Computes mean +/- std and 95% CI for key metrics from each experiment.
+
+    Returns a DataFrame with columns: Experiment, Metric, Mean, Std, 95% CI.
+    """
+    rows = []
+
+    # Exp 1: Prediction Quality -- accuracy per method
+    methods_seen: dict[str, list[float]] = {}
+    for fold_res in fold_results:
+        exp1 = fold_res.get("exp1_prediction_quality", {})
+        tbl = exp1.get("results_table")
+        if tbl is None or tbl.empty or "accuracy" not in tbl.columns:
+            continue
+        for _, r in tbl.iterrows():
+            method = r.get("method", "?")
+            acc = r.get("accuracy", np.nan)
+            if not np.isnan(acc):
+                methods_seen.setdefault(method, []).append(acc)
+
+    for method, accs in methods_seen.items():
+        arr = np.array(accs)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        ci = 1.96 * std_val / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+        rows.append({
+            "Experiment": "Exp1 Pred. Quality",
+            "Metric": f"Accuracy ({method})",
+            "Mean": mean_val,
+            "Std": std_val,
+            "95% CI": f"{mean_val:.4f} +/- {ci:.4f}",
+        })
+
+    # Exp 2: Uncertainty -- coverage and set size per method
+    uq_metrics: dict[str, dict[str, list[float]]] = {}
+    for fold_res in fold_results:
+        exp2 = fold_res.get("exp2_uncertainty", {})
+        tbl = exp2.get("results_table")
+        if tbl is None or tbl.empty:
+            continue
+        for _, r in tbl.iterrows():
+            method = r.get("Method", "?")
+            for col in ["Coverage", "Avg Set Size"]:
+                val = r.get(col, np.nan)
+                if not np.isnan(val):
+                    uq_metrics.setdefault(method, {}).setdefault(col, []).append(val)
+
+    for method, cols in uq_metrics.items():
+        for col, vals in cols.items():
+            arr = np.array(vals)
+            mean_val = float(np.mean(arr))
+            std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            ci = 1.96 * std_val / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+            rows.append({
+                "Experiment": "Exp2 Uncertainty",
+                "Metric": f"{col} ({method})",
+                "Mean": mean_val,
+                "Std": std_val,
+                "95% CI": f"{mean_val:.4f} +/- {ci:.4f}",
+            })
+
+    # Exp 3: Error Detection -- Spearman correlation per signal
+    ed_metrics: dict[str, list[float]] = {}
+    for fold_res in fold_results:
+        exp3 = fold_res.get("exp3_error_detection", {})
+        tbl = exp3.get("results_table")
+        if tbl is None or tbl.empty:
+            continue
+        for _, r in tbl.iterrows():
+            sig = r.get("Signal", "?")
+            corr_val = r.get("Spearman Corr", np.nan)
+            if not np.isnan(corr_val):
+                ed_metrics.setdefault(sig, []).append(corr_val)
+
+    for sig, vals in ed_metrics.items():
+        arr = np.array(vals)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        ci = 1.96 * std_val / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+        rows.append({
+            "Experiment": "Exp3 Error Det.",
+            "Metric": f"Spearman ({sig})",
+            "Mean": mean_val,
+            "Std": std_val,
+            "95% CI": f"{mean_val:.4f} +/- {ci:.4f}",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+def _aggregate_fold_results_regression(
+    fold_results: list[dict],
+    n_folds: int,
+) -> pd.DataFrame:
+    """Aggregate regression experiment results across folds.
+
+    Returns a DataFrame with columns: Experiment, Metric, Mean, Std, 95% CI.
+    """
+    rows = []
+
+    methods_rmse: dict[str, list[float]] = {}
+    methods_mse: dict[str, list[float]] = {}
+    for fold_res in fold_results:
+        exp1 = fold_res.get("exp1_prediction_quality", {})
+        tbl = exp1.get("results_table")
+        if tbl is None or tbl.empty:
+            continue
+        for _, r in tbl.iterrows():
+            method = r.get("method", "?")
+            rmse = r.get("RMSE", np.nan)
+            mse = r.get("MSE", np.nan)
+            if not np.isnan(rmse):
+                methods_rmse.setdefault(method, []).append(rmse)
+            if not np.isnan(mse):
+                methods_mse.setdefault(method, []).append(mse)
+
+    for method, vals in methods_rmse.items():
+        arr = np.array(vals)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        ci = 1.96 * std_val / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+        rows.append({
+            "Experiment": "Exp1 Pred. Quality",
+            "Metric": f"RMSE ({method})",
+            "Mean": mean_val,
+            "Std": std_val,
+            "95% CI": f"{mean_val:.4f} +/- {ci:.4f}",
+        })
+
+    for method, vals in methods_mse.items():
+        arr = np.array(vals)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        ci = 1.96 * std_val / np.sqrt(len(arr)) if len(arr) > 1 else 0.0
+        rows.append({
+            "Experiment": "Exp1 Pred. Quality",
+            "Metric": f"MSE ({method})",
+            "Mean": mean_val,
+            "Std": std_val,
+            "95% CI": f"{mean_val:.4f} +/- {ci:.4f}",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
 # CLI entry point
 # ============================================================
 
 if __name__ == "__main__":
-    results = run_soa_benchmark(seed=42, verbose=True)
+    results = run_soa_benchmark_cv(seed=42, n_folds=5, verbose=True)

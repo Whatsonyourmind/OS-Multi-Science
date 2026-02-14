@@ -40,6 +40,9 @@ from benchmarks.soa_benchmark import (
     experiment_error_detection,
     experiment_diversity_assessment,
     experiment_score_range,
+    experiment_ablation_study,
+    experiment_dependency_penalty,
+    experiment_gating_comparison,
     _icm_weighted_ensemble_classification,
     _icm_weighted_ensemble_regression,
     _compute_per_model_icm_classification,
@@ -811,7 +814,7 @@ class TestConditionalDatasets:
         if "olivetti_faces" not in list_classification_datasets():
             pytest.skip("Olivetti faces not available")
         X_train, X_test, y_train, y_test = load_dataset("olivetti_faces", seed=42)
-        assert X_train.shape[1] == 50  # PCA-reduced
+        assert X_train.shape[1] == 50  # PCA-reduced (fit on train only in load_dataset)
         assert len(np.unique(y_train)) == 40  # 40 classes
         assert y_train.dtype == np.int64
 
@@ -962,6 +965,57 @@ class TestDeepEnsemble:
 # Expanded Benchmark Integration
 # ============================================================
 
+class TestPerSampleICMAggregation:
+    """Tests for per-sample ICM aggregation methods."""
+
+    def test_per_sample_icm_logistic_vs_calibrated_differ(self, iris_preds):
+        """Per-sample ICM with Logistic and Calibrated Beta should differ."""
+        config_logistic = ICMConfig(aggregation="logistic")
+        scores_logistic = _compute_per_sample_icm_classification(iris_preds, config_logistic)
+
+        config_calibrated = ICMConfig(aggregation="calibrated", beta_shape_a=5.0, beta_shape_b=5.0)
+        scores_calibrated = _compute_per_sample_icm_classification(iris_preds, config_calibrated)
+
+        # Scores should not be identical
+        assert not np.allclose(scores_logistic, scores_calibrated, atol=1e-6), (
+            "Logistic and Calibrated Beta per-sample scores should differ"
+        )
+
+    def test_per_sample_icm_respects_aggregation_config(self, iris_preds):
+        """Per-sample ICM should respect config.aggregation setting."""
+        for method in ["logistic", "geometric", "calibrated", "adaptive"]:
+            config = ICMConfig(aggregation=method)
+            scores = _compute_per_sample_icm_classification(iris_preds, config)
+
+            # All scores should be valid
+            assert np.all(scores >= 0.0), f"{method}: scores < 0"
+            assert np.all(scores <= 1.0), f"{method}: scores > 1"
+            assert len(scores) == iris_preds[sorted(iris_preds.keys())[0]].shape[0]
+
+    def test_calibrated_beta_scores_in_range(self, iris_preds):
+        """Calibrated Beta per-sample scores should be in [0, 1]."""
+        config = ICMConfig(aggregation="calibrated", beta_shape_a=5.0, beta_shape_b=5.0)
+        scores = _compute_per_sample_icm_classification(iris_preds, config)
+        assert np.all(scores >= 0.0)
+        assert np.all(scores <= 1.0)
+
+    def test_geometric_aggregation_per_sample(self, iris_preds):
+        """Geometric aggregation should produce valid per-sample scores."""
+        config = ICMConfig(aggregation="geometric")
+        scores = _compute_per_sample_icm_classification(iris_preds, config)
+        assert np.all(scores >= 0.0)
+        assert np.all(scores <= 1.0)
+        assert len(scores) > 0
+
+    def test_adaptive_aggregation_per_sample(self, iris_preds):
+        """Adaptive aggregation should produce valid per-sample scores."""
+        config = ICMConfig(aggregation="adaptive")
+        scores = _compute_per_sample_icm_classification(iris_preds, config)
+        assert np.all(scores >= 0.0)
+        assert np.all(scores <= 1.0)
+        assert len(scores) > 0
+
+
 class TestExpandedBenchmarkIntegration:
     """Integration tests for the expanded benchmark with all datasets."""
 
@@ -991,3 +1045,183 @@ class TestExpandedBenchmarkIntegration:
         agg = results["aggregate_results"]
         # Should have at least 7 classification datasets in accuracy ranking
         assert len(agg["exp1_accuracy_ranking"]) >= 7
+
+
+# ============================================================
+# Tests for Experiment 6: Ablation Study
+# ============================================================
+
+class TestAblationStudy:
+    """Tests for the ablation study experiment."""
+
+    def test_ablation_returns_dict(self, iris_data, trained_clf_models_iris):
+        """Ablation study returns a dict with results_table."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_ablation_study(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        assert isinstance(result, dict)
+        assert "results_table" in result
+        assert isinstance(result["results_table"], pd.DataFrame)
+
+    def test_ablation_has_all_variants(self, iris_data, trained_clf_models_iris):
+        """Ablation study includes all expected variants."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_ablation_study(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        expected = ["Full ICM", "No A (w_A~0)", "No D (w_D~0)",
+                     "No U (w_U~0)", "No C (w_C~0)"]
+        for v in expected:
+            assert v in df["Variant"].values, f"Missing variant: {v}"
+
+    def test_ablation_full_icm_highest_score(self, iris_data, trained_clf_models_iris):
+        """Full ICM should generally produce the highest mean score."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_ablation_study(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        full_score = df[df["Variant"] == "Full ICM"]["Mean Score"].values[0]
+        random_score = df[df["Variant"] == "Random Baseline"]["Mean Score"].values[0]
+        assert full_score > random_score
+
+    def test_ablation_scores_bounded(self, iris_data, trained_clf_models_iris):
+        """All ablation scores should be in [0, 1]."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_ablation_study(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        for score in df["Mean Score"].values:
+            assert 0.0 <= float(score) <= 1.0
+
+
+# ============================================================
+# Tests for Experiment 7: Dependency Penalty
+# ============================================================
+
+class TestDependencyPenalty:
+    """Tests for the dependency penalty experiment."""
+
+    def test_dependency_returns_dict(self, iris_data, trained_clf_models_iris):
+        """Dependency penalty experiment returns expected structure."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        preds_train = collect_predictions_classification(
+            trained_clf_models_iris, X_train,
+        )
+        result = experiment_dependency_penalty(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+            _preds_train=preds_train, _preds_test=preds_test,
+        )
+        assert isinstance(result, dict)
+        assert "results_table" in result
+
+    def test_dependency_has_scenarios(self, iris_data, trained_clf_models_iris):
+        """Should have the three expected scenarios."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        preds_train = collect_predictions_classification(
+            trained_clf_models_iris, X_train,
+        )
+        result = experiment_dependency_penalty(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+            _preds_train=preds_train, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        assert len(df) >= 2  # At least no-pi and with-pi scenarios
+
+    def test_dependency_pi_activates(self, iris_data, trained_clf_models_iris):
+        """With dependency data, Pi should be > 0."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        preds_train = collect_predictions_classification(
+            trained_clf_models_iris, X_train,
+        )
+        result = experiment_dependency_penalty(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42,
+            _preds_train=preds_train, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        # The "with Pi" scenario should have Pi > 0
+        with_pi = df[df["Scenario"].str.contains("with Pi")]
+        if len(with_pi) > 0:
+            pi_vals = with_pi["Pi Value"].values
+            assert any(float(p) > 0 for p in pi_vals)
+
+
+# ============================================================
+# Tests for Experiment 8: Gating Comparison
+# ============================================================
+
+class TestGatingComparison:
+    """Tests for the gating comparison experiment."""
+
+    def test_gating_returns_dict(self, iris_data, trained_clf_models_iris):
+        """Gating comparison returns expected structure."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_gating_comparison(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        assert isinstance(result, dict)
+        assert "results_table" in result
+
+    def test_gating_has_all_methods(self, iris_data, trained_clf_models_iris):
+        """Should compare ICM against simpler gating methods."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_gating_comparison(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        methods = list(df["Method"].values)
+        assert "ICM (wide-range)" in methods
+        assert "Entropy Only" in methods
+
+    def test_gating_act_pcts_valid(self, iris_data, trained_clf_models_iris):
+        """ACT percentages should be between 0 and 100."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_gating_comparison(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        for act in df["ACT%"].values:
+            assert 0.0 <= float(act) <= 100.0

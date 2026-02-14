@@ -49,29 +49,27 @@ def _make_circles_loader():
 
 
 def _olivetti_faces_loader():
-    """Load Olivetti Faces with PCA to 50 dims: 40 classes, 400 samples.
+    """Load Olivetti Faces (raw): 40 classes, 400 samples, 4096 features.
 
-    Uses PCA to reduce from 4096 to 50 features for tractable model
-    training (SVM with 40 classes on 4096 features is very slow).
+    Returns raw pixel data; PCA dimensionality reduction is applied
+    *after* the train/test split in load_dataset() to prevent data leakage.
     """
     from sklearn.datasets import fetch_olivetti_faces
-    from sklearn.decomposition import PCA
 
     data = fetch_olivetti_faces()
-    # Reduce dimensionality for speed: 4096 -> 50 via PCA
-    pca = PCA(n_components=50, random_state=42)
-    X_reduced = pca.fit_transform(data.data)
-    return _BunchLike(X_reduced, data.target)
+    return _BunchLike(data.data, data.target)
 
 
 def _covertype_loader():
-    """Load Covertype dataset (first 2000 samples): 54 features, 7 classes."""
+    """Load Covertype dataset (random 2000 samples): 54 features, 7 classes."""
     try:
         from sklearn.datasets import fetch_covtype
         data = fetch_covtype()
-        # Subsample to keep benchmark fast: first 2000 samples
-        X = data.data[:2000]
-        y = data.target[:2000]
+        # Subsample to keep benchmark fast: random 2000 samples (fixed seed)
+        rng = np.random.default_rng(42)
+        indices = rng.choice(len(data.data), size=2000, replace=False)
+        X = data.data[indices]
+        y = data.target[indices]
         # Covertype target is 1-indexed (1..7), convert to 0-indexed for consistency
         y = y - 1
         return _BunchLike(X, y)
@@ -229,7 +227,7 @@ try:
     from sklearn.datasets import fetch_covtype  # noqa: F401
     _CLASSIFICATION_DATASETS["covertype"] = {
         "loader": _covertype_loader,
-        "description": "Covertype (54 features, 7 classes, 2000 samples subset)",
+        "description": "Covertype (54 features, 7 classes, 2000 random samples)",
         "task": "classification",
     }
 except ImportError:
@@ -240,8 +238,9 @@ try:
     from sklearn.datasets import fetch_olivetti_faces  # noqa: F401
     _CLASSIFICATION_DATASETS["olivetti_faces"] = {
         "loader": _olivetti_faces_loader,
-        "description": "Olivetti Faces (50 PCA features, 40 classes, 400 samples)",
+        "description": "Olivetti Faces (4096 raw features -> 50 PCA, 40 classes, 400 samples)",
         "task": "classification",
+        "pca_components": 50,
     }
 except ImportError:
     pass
@@ -374,9 +373,80 @@ def load_dataset(
         X, y, test_size=test_size, random_state=seed, stratify=y if entry["task"] == "classification" else None,
     )
 
+    # PCA dimensionality reduction (fit on train only to prevent data leakage)
+    pca_components = entry.get("pca_components")
+    if pca_components is not None:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=pca_components, random_state=seed)
+        X_train = pca.fit_transform(X_train)
+        X_test = pca.transform(X_test)
+
     # Standardize features (fit on train only)
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
     return X_train, X_test, y_train, y_test
+
+
+def load_dataset_full(
+    name: str,
+) -> tuple[NDArray, NDArray, str, int | None]:
+    """Load full dataset without splitting, for cross-validation.
+
+    Returns the raw (unstandardized) feature matrix and target vector,
+    the task type, and the number of PCA components to apply per-fold
+    (or None if no PCA is needed).
+
+    PCA is NOT applied here to prevent data leakage in CV -- callers
+    must fit PCA on each fold's training set and transform the test set.
+
+    For concept_drift, returns the concatenated training data only
+    (the test set is generated from a different distribution, so
+    standard k-fold does not apply -- callers should use the regular
+    ``load_dataset`` for concept_drift instead).
+
+    Parameters
+    ----------
+    name : str
+        Dataset name (one of ``list_datasets()``).
+
+    Returns
+    -------
+    tuple of (X, y, task_type, pca_components)
+        X : np.float64 array of shape (n_samples, n_features).
+        y : np.int64 or np.float64 array of shape (n_samples,).
+        task_type : str, either ``"classification"`` or ``"regression"``.
+        pca_components : int or None -- number of PCA components to apply
+            per-fold, or None if no dimensionality reduction is needed.
+
+    Raises
+    ------
+    ValueError
+        If *name* is not a recognized dataset.
+    """
+    if name not in _ALL_DATASETS:
+        raise ValueError(
+            f"Unknown dataset: {name!r}. "
+            f"Available: {list_datasets()}"
+        )
+
+    entry = _ALL_DATASETS[name]
+    task_type = entry["task"]
+
+    data = entry["loader"]()
+    if data is None:
+        raise RuntimeError(f"Loader for {name!r} returned None (dataset unavailable).")
+    X = np.asarray(data.data, dtype=np.float64)
+    y = np.asarray(data.target)
+
+    # Ensure correct dtype for target
+    if task_type == "classification":
+        y = y.astype(np.int64)
+    else:
+        y = y.astype(np.float64)
+
+    # Return PCA info for caller to apply per-fold (no leakage)
+    pca_components = entry.get("pca_components")
+
+    return X, y, task_type, pca_components
