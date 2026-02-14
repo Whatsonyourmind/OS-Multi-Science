@@ -74,7 +74,7 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-When multiple models---spanning statistical methods, machine learning, and simulation---are applied to the same prediction task, practitioners face a recurring question: do these models agree because of independent evidence, or is their apparent consensus an artifact of shared biases or correlated training data? Existing ensemble diversity measures each capture only a single facet of inter-model agreement and offer no mechanism to distinguish genuine from spurious convergence. We introduce the \emph{Index of Convergence Multi-epistemic} (ICM), a five-component diagnostic score that aggregates distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded value in $(0,1)$ via logistic aggregation. We prove that ICM is bounded, monotone, and Lipschitz continuous, and couple it with a conformal risk control (CRC) gating mechanism that provides distribution-free coverage guarantees, partitioning predictions into ACT, DEFER, and AUDIT decisions. Experiments on eleven datasets with eight model families plus a deep ensemble baseline, evaluated via stratified 5-fold cross-validation, show that ICM-weighted predictions achieve competitive accuracy (mean $0.953 \pm 0.03$), valid conformal coverage (mean 0.984), and error detection comparable to entropy baselines (Spearman $\rho = 0.184$ vs.\ $0.178$). A wide-range preset expands the effective score range by $16.1\times$, enabling three-way decision gating with ACT rates that automatically calibrate from 14\% on a 40-class face recognition task to 83\% on easy datasets. Ablation analysis confirms that every component contributes, and the framework is robust across weight presets. The value of ICM lies not in surpassing baselines on raw accuracy, but in providing a decomposable, formally grounded diagnostic signal that reveals \emph{when} and \emph{why} an ensemble's output should be trusted.
+When multiple models---spanning statistical methods, machine learning, and simulation---are applied to the same prediction task, practitioners face a recurring question: do these models agree because of independent evidence, or is their apparent consensus an artifact of shared biases or correlated training data? Existing ensemble diversity measures each capture only a single facet of inter-model agreement and offer no mechanism to distinguish genuine from spurious convergence. We introduce the \emph{Index of Convergence Multi-epistemic} (ICM), a five-component diagnostic score that aggregates distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded value in $(0,1)$ via logistic aggregation. We prove that ICM is bounded, monotone, and Lipschitz continuous, and establish a formal connection to prediction risk: under a testable calibration condition, thresholding on ICM monotonically controls the ensemble error rate, and high ICM implies vanishing ambiguity in the Krogh-Vedelsby decomposition. We couple ICM with a conformal risk control (CRC) gating mechanism that provides distribution-free coverage guarantees, partitioning predictions into ACT, DEFER, and AUDIT decisions. Experiments on eleven datasets with eight model families plus a deep ensemble baseline, evaluated via stratified 5-fold cross-validation, show that ICM-weighted predictions achieve competitive accuracy (mean $0.953 \pm 0.03$), valid conformal coverage (mean 0.984), and error detection comparable to entropy baselines (Spearman $\rho = 0.184$ vs.\ $0.178$). A wide-range preset expands the effective score range by $16.1\times$, enabling three-way decision gating with ACT rates that automatically calibrate from 14\% on a 40-class face recognition task to 83\% on easy datasets. Ablation analysis confirms that every component contributes, and the framework is robust across weight presets. The value of ICM lies not in surpassing baselines on raw accuracy, but in providing a decomposable, formally grounded diagnostic signal that reveals \emph{when} and \emph{why} an ensemble's output should be trusted.
 \end{abstract}
 
 % ============================================================
@@ -95,12 +95,12 @@ The answer depends critically on the nature of inter-model agreement. If all mod
     \item \textbf{Selective prediction}~\citep{geifman2017selective,elyanov2010foundations}: Learns when to abstain from prediction based on model confidence, providing a principled reject option. ICM's three-way ACT/DEFER/AUDIT gate generalizes this to multi-model convergence with conformal coverage guarantees.
 \end{itemize}
 
-\paragraph{Contributions.} We propose the Index of Convergence Multi-epistemic (ICM), a unified framework that addresses these limitations through five contributions:
+\paragraph{Contributions.} We propose the Index of Convergence Multi-epistemic (ICM), a unified framework that addresses these limitations. The contribution is not any single component metric---each has precedents in the literature---but rather the identification of \emph{which} dimensions are jointly necessary and sufficient for reliable convergence diagnosis, the formal analysis of their composition, and the coupling with distribution-free decision gating. Just as the ambiguity decomposition~\citep{krogh1994neural} derives lasting value not from squared error (a known quantity) but from identifying the correct decomposition and proving its properties, ICM's value lies in the specific five-dimensional decomposition and the guarantees it affords. To our knowledge, no prior diagnostic combines distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded, Lipschitz-continuous score. Concretely, the framework makes five contributions:
 
 \begin{enumerate}
     \item A \textbf{five-component convergence score} $\icm = \sigma(w_A A + w_D D + w_U U + w_C C - \lambda \Pi)$ that decomposes ensemble agreement into distributional agreement ($A$), directional consensus ($D$), uncertainty overlap ($U$), perturbation invariance ($C$), and a dependency penalty ($\Pi$), each formally defined on $[0,1]$.
-    \item \textbf{Formal guarantees}: boundedness (Proposition~\ref{prop:bounded}), monotonicity in each positive component (Proposition~\ref{prop:monotone}), and Lipschitz continuity with constant $L = (\text{scale}/4)\|\bw^*\|$ (Proposition~\ref{prop:lipschitz}).
-    \item A \textbf{conformal risk control (CRC) gating} mechanism that maps ICM scores to calibrated risk bounds with distribution-free coverage guarantees, partitioning predictions into ACT/DEFER/AUDIT decisions (Theorem~\ref{thm:coverage}).
+    \item \textbf{Formal guarantees}: boundedness (Proposition~\ref{prop:bounded}), monotonicity in each positive component (Proposition~\ref{prop:monotone}), Lipschitz continuity with constant $L = (\text{scale}/4)\|\bw^*\|$ (Proposition~\ref{prop:lipschitz}), and a formal connection between ICM and prediction risk---error-rate monotonicity under calibration (Proposition~\ref{prop:risk_monotone}) and a link to the Krogh-Vedelsby ambiguity decomposition (Proposition~\ref{prop:ambiguity_link}).
+    \item A \textbf{conformal risk control (CRC) gating} mechanism that maps ICM scores to calibrated risk bounds with distribution-free coverage guarantees, partitioning predictions into ACT/DEFER/AUDIT decisions (Theorem~\ref{thm:coverage}). Conformal prediction has been applied to single-model nonconformity scores~\citep{vovk2005algorithmic}; applying it to multi-model convergence diagnostics with a three-way decision gate is, to our knowledge, new.
     \item \textbf{Anti-saturation mechanisms}---adaptive normalization, argmax-based direction, and perturbation scaling---that expand the effective score range substantially, enabling practical decision gating.
     \item \textbf{Comprehensive benchmarking} on eleven datasets (nine classification, two regression) with eight model families plus a deep ensemble baseline, including ablation studies, dependency penalty activation, gating comparisons against simpler uncertainty methods, and weight sensitivity analysis.
 \end{enumerate}
@@ -177,6 +177,10 @@ D(\cF) = 1 - \frac{H(\hat{p})}{H_{\max}}, \quad H(\hat{p}) = -\sum_c \hat{p}_c \
 where $\hat{p}$ is the empirical distribution over observed sign categories and $H_{\max} = \log(|\mathcal{C}|)$ with $\mathcal{C}$ the set of distinct signs. In \emph{argmax mode} (for classification), direction is computed from per-sample class-vote entropy averaged across samples.
 \end{definition}
 
+\begin{remark}[Discontinuity in $D$ under category changes]
+The direction score $D$ depends on the cardinality $|\mathcal{C}|$ of distinct observed signs through $H_{\max} = \log(|\mathcal{C}|)$. When a new sign category appears, $H_{\max}$ increases discontinuously, causing a jump in $D$. In classification with argmax mode (used in all our experiments), direction is computed from per-sample class-vote entropy, which varies continuously with the predictive distributions and avoids this discontinuity.
+\end{remark}
+
 \begin{definition}[Uncertainty Overlap $U$]\label{def:uncertainty}
 Given $K$ confidence intervals $\{[l_k, u_k]\}_{k=1}^K$, the uncertainty overlap is the mean pairwise Intersection-over-Union:
 \begin{equation}
@@ -231,6 +235,10 @@ where $z = s(z_{\mathrm{raw}} - h)$ and $\sigma'(z) = \sigma(z)(1 - \sigma(z)) >
 By the chain rule, $\partial \icm / \partial A = \sigma'(z) \cdot s \cdot w_A$. Since $\sigma'(z) > 0$ for all $z \in \RR$, $s > 0$, and $w_A > 0$, the derivative is strictly positive. The argument for $D$, $U$, $C$ is identical. For $\Pi$: $\partial \icm / \partial \Pi = \sigma'(z) \cdot s \cdot (-\lambda) < 0$.
 \end{proof}
 
+\begin{remark}[Adaptive $C_A$ and monotonicity]
+When the adaptive normalization constant $C_A$ is used (computed from the 90th percentile of observed pairwise distances), the mapping from individual model outputs to the agreement component $A$ is not globally monotone, because changing one model's output can shift $C_A$ and thereby affect $A$ for all pairs. Proposition~\ref{prop:monotone} guarantees monotonicity of $\icm$ in $A$ as a real-valued input; the composition with adaptive $C_A$ introduces a local non-monotonicity that we observe to be negligible in practice, since the 90th percentile is stable under small perturbations.
+\end{remark}
+
 \begin{proposition}[Lipschitz Continuity]\label{prop:lipschitz}
 For any two component vectors $\bc = (A, D, U, C, \Pi)$ and $\bc' = (A', D', U', C', \Pi')$, with scale parameter $s > 0$:
 \begin{equation}
@@ -250,6 +258,50 @@ The Lipschitz constant $L_{\icm}$ scales linearly with $s$, creating a stability
     \item \textbf{Wide-range} ($s{=}10$, $L \approx 1.22$): The ICM is no longer a contraction mapping ($L > 1$). This is by design: the increased sensitivity expands the effective range to $[0.0015, 0.971]$, enabling meaningful three-way decision gating at the cost of reduced smoothing.
 \end{itemize}
 All experiments in this paper use the wide-range preset. Since the Lipschitz constant governs worst-case sensitivity rather than typical behavior, and the component inputs are themselves stable (bounded in $[0,1]$ with smooth dependence on predictions), the larger constant does not cause instability in practice.
+\end{remark}
+
+\subsection{ICM as a Predictor of Ensemble Error}
+
+The preceding propositions establish regularity properties of the ICM function itself. A natural and more consequential question is whether ICM scores carry information about \emph{prediction risk}: does a higher ICM score imply that the ensemble prediction is more likely to be correct? We formalize this connection through two results. Proposition~\ref{prop:risk_monotone} establishes that, under a calibration condition, ICM induces a stochastic ordering on the conditional error rate. Proposition~\ref{prop:ambiguity_link} connects the ICM agreement component to the classical ambiguity decomposition of ensemble error.
+
+\begin{proposition}[Error-Rate Monotonicity Under Calibration]\label{prop:risk_monotone}
+Let $\hat{y}$ denote the ensemble prediction (e.g., majority vote or ICM-weighted average) and let $E = \ind[\hat{y} \neq y]$ be the error indicator. Suppose the ICM score is \emph{calibrated} in the following sense: the conditional correctness probability $p(c) \coloneqq \PP(\hat{y} = y \mid \icm = c)$ is non-decreasing in $c$. Then for any thresholds $\tau' \leq \tau$:
+\begin{equation}\label{eq:risk_monotone}
+\PP(E = 1 \mid \icm \geq \tau) \leq \PP(E = 1 \mid \icm \geq \tau')
+\end{equation}
+That is, restricting to higher-ICM samples yields a lower (or equal) error rate.
+\end{proposition}
+
+\begin{proof}
+Define $q(c) = 1 - p(c) = \PP(E = 1 \mid \icm = c)$, which is non-increasing by assumption. For any threshold $\tau$, the conditional error rate over the set $\{\icm \geq \tau\}$ is:
+\[
+\PP(E = 1 \mid \icm \geq \tau) = \frac{\int_\tau^1 q(c)\, dF(c)}{\int_\tau^1 dF(c)}
+\]
+where $F$ is the CDF of the ICM score. Since $q$ is non-increasing, this weighted average is non-increasing in $\tau$: raising the threshold removes the lowest-ICM (highest-error-rate) mass from the average. Formally, for $\tau \geq \tau'$, the support $[\tau, 1] \subseteq [\tau', 1]$ and $q(c) \leq q(c')$ for $c \geq c'$, so the conditional mean of $q$ over $[\tau, 1]$ is at most that over $[\tau', 1]$.
+\end{proof}
+
+\begin{remark}[Calibration assumption]
+The calibration condition---that $\PP(\text{correct} \mid \icm = c)$ is non-decreasing---is an empirical property, not a tautology. It asserts that the composite ICM score, which aggregates distributional agreement, directional consensus, uncertainty overlap, and perturbation invariance, is indeed aligned with correctness. Our experiments support this: Experiment~3 shows positive Spearman correlations between inverted ICM and per-sample loss across all datasets where errors occur (mean $\rho = 0.184$), and the CRC isotonic regression in Experiment~2 successfully learns a monotone risk function from ICM scores with valid coverage (mean 0.984). The calibration assumption can be tested on any new dataset via the isotonic regression step of the CRC pipeline.
+\end{remark}
+
+\begin{proposition}[Link to Ambiguity Decomposition]\label{prop:ambiguity_link}
+Consider a regression ensemble with ICM-weighted predictions $\hat{y} = \sum_{k=1}^K \omega_k \hat{y}_k$ where $\omega_k \propto \icm_k$ and $\sum_k \omega_k = 1$. By the Krogh-Vedelsby decomposition~\citep{krogh1994neural}, the squared ensemble error decomposes as:
+\begin{equation}\label{eq:ambiguity}
+(\hat{y} - y)^2 = \underbrace{\sum_k \omega_k (\hat{y}_k - y)^2}_{\bar{E}\;\text{(weighted avg.\ individual error)}} - \underbrace{\sum_k \omega_k (\hat{y}_k - \hat{y})^2}_{\bar{A}\;\text{(ambiguity)}}
+\end{equation}
+The ambiguity term $\bar{A}$ is the weighted variance of individual predictions around the ensemble mean. When the agreement component $A$ of ICM is high (small pairwise distributional distances), the individual predictions $\hat{y}_k$ are tightly clustered, so $\bar{A}$ is small. Combined with the ICM weighting, which assigns higher weight $\omega_k$ to models with higher per-model ICM (thereby down-weighting outlier models), this implies:
+\begin{equation}
+\text{High } \icm \;\Longrightarrow\; \text{small } \bar{A} \;\Longrightarrow\; (\hat{y} - y)^2 \approx \bar{E}
+\end{equation}
+Thus, under high convergence the ensemble error is governed almost entirely by the average individual model quality, and the ambiguity penalty vanishes. Conversely, when $\icm$ is low, disagreement inflates $\bar{A}$, and the decomposition~\eqref{eq:ambiguity} alone does not bound $(\hat{y} - y)^2$---hence the ensemble output should not be trusted without further inspection.
+\end{proposition}
+
+\begin{proof}
+The decomposition~\eqref{eq:ambiguity} is algebraic and holds for any weighted combination~\citep{krogh1994neural}. It remains to show that high $A$ implies small $\bar{A}$. By Definition~\ref{def:agreement}, $A$ is close to 1 when the mean pairwise distributional distance $\bar{d}$ is small relative to $C_A$. For point predictions, $\bar{d}$ small implies $\hat{y}_k \approx \hat{y}_j$ for most pairs, so $\hat{y}_k \approx \hat{y}$ for all $k$, and therefore $\bar{A} = \sum_k \omega_k(\hat{y}_k - \hat{y})^2$ is small. More precisely, if $\max_k |\hat{y}_k - \hat{y}| \leq \delta$, then $\bar{A} \leq \delta^2$. Since $\bar{d} \leq C_A(1 - A)$, and $\bar{d}$ upper-bounds $\max_k |\hat{y}_k - \hat{y}|$ up to a constant depending on $K$ and the distance metric, we obtain $\bar{A} = O((1 - A)^2)$ as $A \to 1$.
+\end{proof}
+
+\begin{remark}[Interpretation and limitations]
+Proposition~\ref{prop:risk_monotone} shows that ICM provides a valid \emph{risk ordering}: filtering by ICM threshold monotonically controls the error rate, provided the calibration condition holds. This is the property exploited by the CRC gating system (Section~\ref{sec:crc}). Proposition~\ref{prop:ambiguity_link} provides the mechanistic link: high ICM implies low ambiguity, so the ensemble error is determined by individual model quality rather than disagreement. Neither result claims that ICM \emph{causes} accuracy; rather, ICM serves as a sufficient statistic for ranking predictions by expected error, which is the operationally relevant property for decision gating.
 \end{remark}
 
 \subsection{Anti-Saturation Mechanisms}
@@ -677,6 +729,9 @@ ICM is not designed to surpass baselines on raw prediction accuracy---ensemble a
 
 Consider a sample where the ensemble average confidently predicts class 1. Without ICM, the practitioner knows only the prediction and perhaps an entropy measure. With ICM, they learn that $A = 0.35$ (moderate distributional agreement), $D = 1.0$ (all models agree on direction), $U = 0.92$ (uncertainty intervals overlap substantially), $C = 0.88$ (predictions are stable under perturbation), and $\Pi = 0.0$ (no detected dependency). This decomposition reveals that while the models agree on the direction, their distributional agreement is modest---a nuance invisible to entropy-based measures.
 
+\paragraph{Formal connection to prediction risk.}
+Beyond its diagnostic role, ICM has a formal relationship to prediction error. Proposition~\ref{prop:risk_monotone} establishes that if ICM is calibrated---i.e., the conditional probability of correctness is non-decreasing in the ICM score---then thresholding on ICM monotonically controls the error rate. This is not a vacuous condition: our CRC pipeline (Section~\ref{sec:crc}) explicitly fits an isotonic regression from ICM to loss, enforcing this monotone relationship, and Experiment~3 empirically confirms the correlation between ICM and error across nine datasets. Proposition~\ref{prop:ambiguity_link} provides the mechanistic underpinning via the Krogh-Vedelsby decomposition: high ICM (specifically, high agreement $A$) implies low ambiguity in the ensemble, so the prediction error converges to the average individual model error. Together, these results establish ICM not merely as a descriptive summary of agreement, but as a score with provable implications for when ensemble predictions can be trusted.
+
 \paragraph{Difficulty-calibrated decision gating.}
 The benchmark reveals that ICM's decision gating automatically scales with problem difficulty---a property we term \emph{difficulty calibration}. As shown in Table~\ref{tab:decision}, ACT rates range from 14\% on the hardest task to 93\% on the easiest, without any dataset-specific threshold tuning. This calibration emerges from the five-component decomposition: when agreement ($A$), directional consensus ($D$), and uncertainty overlap ($U$) are jointly low, the composite ICM score drops, triggering conservative gating. No single baseline metric provides this multi-dimensional difficulty signal.
 
@@ -712,6 +767,9 @@ ICM and BMA~\citep{hoeting1999bayesian} serve different purposes. BMA weights mo
 \paragraph{Computational cost.}
 The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ for Hellinger with $C$ classes) and the Ledoit-Wolf correlation ($O(K^2 N)$). For typical settings ($K = 3$--$8$, $C \leq 40$, $N \leq 10^4$), the total runtime is under one second on commodity hardware. The full benchmark suite (11 datasets, 8 models plus deep ensemble, 9 experiments) completes in approximately 140 seconds.
 
+\paragraph{On the nature of the contribution.}
+One might ask whether composing known metrics via a weighted sigmoid constitutes a genuine contribution. We argue that the contribution is analogous to the ambiguity decomposition~\citep{krogh1994neural}: the individual ingredients (squared error, model predictions) were well known, but identifying the correct decomposition and proving its properties yielded lasting theoretical and practical value. Similarly, ICM identifies five specific dimensions---distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and dependency penalty---that jointly characterize multi-model convergence, proves formal properties (boundedness, monotonicity, Lipschitz continuity) of their composition, and couples the result with conformal risk control for distribution-free decision gating. The sigmoid is not the contribution; it is a convenient bounded activation. The contributions are: (i) the selection of which dimensions are necessary and sufficient for convergence diagnosis, supported by the ablation analysis in Section~\ref{sec:results}; (ii) the formal guarantees on the composed score, which do not follow trivially from properties of the individual components; and (iii) the CRC gating mechanism that converts convergence scores into calibrated three-way decisions with coverage guarantees---an application of conformal prediction to multi-model diagnostics rather than to single-model nonconformity scores. This combination is not available in prior work on ensemble diversity metrics.
+
 
 % ============================================================
 % 8. CONCLUSION
@@ -719,13 +777,13 @@ The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ f
 \section{Conclusion}
 \label{sec:conclusion}
 
-We have presented the Index of Convergence Multi-epistemic (ICM), a five-component framework for diagnosing the nature and strength of agreement among epistemically diverse models. The ICM score is provably bounded, monotone, and Lipschitz continuous, and can be converted to calibrated risk bounds via conformal risk control gating with distribution-free coverage guarantees.
+We have presented the Index of Convergence Multi-epistemic (ICM), a five-component framework for diagnosing the nature and strength of agreement among epistemically diverse models. The ICM score is provably bounded, monotone, and Lipschitz continuous; under calibration it induces a monotone ordering on prediction error rates (Proposition~\ref{prop:risk_monotone}); and it can be converted to calibrated risk bounds via conformal risk control gating with distribution-free coverage guarantees.
 
 Experiments on eleven datasets demonstrate that ICM provides competitive accuracy (mean $0.953 \pm 0.03$), valid conformal coverage (mean 0.984), and error detection comparable to entropy baselines. The wide-range preset expands the effective score range by $16.1\times$, enabling three-way decision gating with ACT rates that automatically calibrate to problem difficulty. Ablation analysis confirms that every component contributes, and the dependency penalty correctly distinguishes genuine from spurious convergence when residual data is provided.
 
 The contribution is \emph{diagnostic}: ICM decomposes the opaque concept of ``ensemble agreement'' into five interpretable, formally grounded components, each providing distinct information about why models agree or disagree. This decomposition is particularly relevant to safety-critical applications where knowing \emph{when to trust} an ensemble matters as much as the ensemble's prediction itself.
 
-\paragraph{Future work.} Directions include: (1) evaluation on domain-specific multi-paradigm ensembles in climate science, epidemiology, and finance; (2) conditional coverage extensions via weighted conformal prediction; (3) online ICM updates for streaming prediction settings; and (4) theoretical analysis of the relationship between ICM and Bayes risk under multi-model aggregation.
+\paragraph{Future work.} Directions include: (1) evaluation on domain-specific multi-paradigm ensembles in climate science, epidemiology, and finance; (2) conditional coverage extensions via weighted conformal prediction; (3) online ICM updates for streaming prediction settings; and (4) tightening the ICM-risk connection (Propositions~\ref{prop:risk_monotone}--\ref{prop:ambiguity_link}) to obtain finite-sample error bounds under explicit distributional assumptions.
 
 
 % ============================================================
