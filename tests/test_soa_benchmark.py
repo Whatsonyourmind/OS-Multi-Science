@@ -43,6 +43,8 @@ from benchmarks.soa_benchmark import (
     experiment_ablation_study,
     experiment_dependency_penalty,
     experiment_gating_comparison,
+    experiment_weight_sensitivity,
+    WEIGHT_PRESETS,
     _icm_weighted_ensemble_classification,
     _icm_weighted_ensemble_regression,
     _compute_per_model_icm_classification,
@@ -1225,3 +1227,90 @@ class TestGatingComparison:
         df = result["results_table"]
         for act in df["ACT%"].values:
             assert 0.0 <= float(act) <= 100.0
+
+
+# ============================================================
+# Tests for Experiment 9: Weight Sensitivity Analysis
+# ============================================================
+
+class TestWeightSensitivity:
+    """Tests for the weight sensitivity experiment."""
+
+    def test_weight_sensitivity_runs(self, iris_data, trained_clf_models_iris):
+        """Weight sensitivity experiment runs and returns expected structure."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_weight_sensitivity(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        assert isinstance(result, dict)
+        assert "results_table" in result
+        assert isinstance(result["results_table"], pd.DataFrame)
+        assert len(result["results_table"]) == len(WEIGHT_PRESETS)
+        assert "stability" in result
+        assert "preset_scores" in result
+        assert result["skip_reason"] is None
+
+        # Check expected columns
+        df = result["results_table"]
+        for col in ["Preset", "w_A", "w_D", "w_U", "w_C", "lam",
+                     "Mean ICM", "Score Range", "ICM-Weighted Acc", "ACT Rate"]:
+            assert col in df.columns, f"Missing column: {col}"
+
+        # Check stability dict has expected keys
+        stab = result["stability"]
+        for key in ["cv_mean_icm", "accuracy_range", "accuracy_std",
+                     "mean_icm_std", "mean_icm_mean", "n_presets"]:
+            assert key in stab, f"Missing stability key: {key}"
+
+    def test_weight_sensitivity_default_included(self, iris_data, trained_clf_models_iris):
+        """The 'Default' weight preset should appear in the results."""
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_weight_sensitivity(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        df = result["results_table"]
+        presets = list(df["Preset"].values)
+        assert "Default" in presets
+        assert "Equal" in presets
+
+        # Default preset should use the project's current weights
+        default_row = df[df["Preset"] == "Default"].iloc[0]
+        assert float(default_row["w_A"]) == pytest.approx(0.35, abs=1e-6)
+        assert float(default_row["w_D"]) == pytest.approx(0.15, abs=1e-6)
+        assert float(default_row["w_U"]) == pytest.approx(0.25, abs=1e-6)
+        assert float(default_row["w_C"]) == pytest.approx(0.10, abs=1e-6)
+        assert float(default_row["lam"]) == pytest.approx(0.15, abs=1e-6)
+
+    def test_weight_sensitivity_accuracy_stable(self, iris_data, trained_clf_models_iris):
+        """Accuracy should not vary dramatically across weight presets.
+
+        A range of less than 0.15 (15 percentage points) across all
+        presets indicates the framework is robust to weight choice.
+        """
+        X_train, X_test, y_train, y_test = iris_data
+        preds_test = collect_predictions_classification(
+            trained_clf_models_iris, X_test,
+        )
+        result = experiment_weight_sensitivity(
+            "iris", X_train, X_test, y_train, y_test,
+            task="classification", seed=42, _preds_test=preds_test,
+        )
+        stab = result["stability"]
+        # Accuracy range should be small -- weights change ICM scores
+        # but the ICM-weighted ensemble accuracy should remain stable
+        assert stab["accuracy_range"] < 0.15, (
+            f"Accuracy range {stab['accuracy_range']:.4f} exceeds 0.15; "
+            f"framework appears sensitive to weight choice"
+        )
+        # All accuracies in results table should be valid
+        df = result["results_table"]
+        for acc in df["ICM-Weighted Acc"].values:
+            assert 0.0 <= float(acc) <= 1.0

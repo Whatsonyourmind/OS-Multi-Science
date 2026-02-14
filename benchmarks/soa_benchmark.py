@@ -1721,6 +1721,196 @@ def experiment_gating_comparison(
     }
 
 
+# ============================================================
+# Experiment 9: Weight Sensitivity Analysis
+# ============================================================
+
+# Weight presets for sensitivity analysis.  Each maps a human-readable name
+# to a tuple (w_A, w_D, w_U, w_C, lam).  The presets cover equal weighting,
+# single-component dominance, and the project's current default.
+
+WEIGHT_PRESETS: dict[str, tuple[float, float, float, float, float]] = {
+    "Equal":      (0.20, 0.20, 0.20, 0.20, 0.20),
+    "A-dominant": (0.50, 0.15, 0.15, 0.10, 0.10),
+    "D-dominant": (0.15, 0.50, 0.15, 0.10, 0.10),
+    "U-dominant": (0.15, 0.15, 0.50, 0.10, 0.10),
+    "C-dominant": (0.15, 0.15, 0.10, 0.50, 0.10),
+    "Pi-dominant":(0.10, 0.10, 0.10, 0.10, 0.60),
+    "Default":    (0.35, 0.15, 0.25, 0.10, 0.15),
+}
+
+
+def experiment_weight_sensitivity(
+    dataset_name: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    task: str,
+    seed: int = 42,
+    config: ICMConfig | None = None,
+    _preds_test: dict[str, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Experiment 9 -- Weight Sensitivity Analysis.
+
+    Addresses the reviewer concern that the ICM component weights
+    (w_A, w_D, w_U, w_C, lambda) are somewhat arbitrary by showing that
+    the framework is robust to reasonable weight perturbations.
+
+    For each of several weight presets (equal, A-dominant, D-dominant,
+    U-dominant, C-dominant, Pi-dominant, and the current default), computes
+    per-sample ICM scores on the test set and measures:
+
+    * Mean ICM score
+    * Score range (max - min)
+    * ICM-Weighted accuracy (ensemble weighted by per-model ICM)
+    * ACT rate (fraction of samples with ICM >= tau_hi from
+      the wide_range preset)
+
+    A stability metric is computed as the coefficient of variation (CV)
+    of mean ICM scores across presets: lower CV = more robust.  An
+    accuracy stability metric reports how much accuracy varies.
+
+    For regression datasets the experiment is skipped (classification only).
+
+    Parameters
+    ----------
+    dataset_name : str
+        Name of the dataset being evaluated.
+    X_train, X_test : np.ndarray
+        Training and test feature matrices.
+    y_train, y_test : np.ndarray
+        Training and test labels.
+    task : str
+        ``'classification'`` or ``'regression'``.
+    seed : int
+        Random seed.
+    config : ICMConfig or None
+        Base configuration.  If None, uses ``ICMConfig.wide_range_preset()``.
+    _preds_test : dict or None
+        Pre-computed test predictions (optional, avoids re-training).
+
+    Returns
+    -------
+    dict with keys:
+        'results_table'      : pd.DataFrame -- one row per weight preset.
+        'stability'          : dict -- CV of mean ICM score and accuracy range.
+        'preset_scores'      : dict mapping preset name to per-sample ICM array.
+        'skip_reason'        : str or None -- set for regression datasets.
+    """
+    if config is None:
+        config = ICMConfig.wide_range_preset()
+
+    if task != "classification":
+        return {
+            "results_table": pd.DataFrame(),
+            "stability": {},
+            "preset_scores": {},
+            "skip_reason": "regression dataset",
+        }
+
+    # Obtain predictions -----------------------------------------------
+    if _preds_test is not None:
+        preds_test = _preds_test
+    else:
+        models = build_classification_zoo(seed=seed)
+        train_zoo(models, X_train, y_train)
+        preds_test = collect_predictions_classification(models, X_test)
+
+    y_test_int = np.asarray(y_test, dtype=int)
+    n_samples = y_test_int.shape[0]
+    tau_hi = 0.7  # from wide_range preset
+
+    # Ensemble average predictions for accuracy computation
+    avg_pred = _mean_proba(preds_test)
+    if avg_pred.ndim == 1:
+        avg_pred = np.column_stack([1.0 - avg_pred, avg_pred])
+    ensemble_class = np.argmax(avg_pred, axis=1)
+
+    results_rows: list[dict[str, Any]] = []
+    preset_scores: dict[str, np.ndarray] = {}
+    mean_scores: list[float] = []
+    accuracies: list[float] = []
+
+    for preset_name, (wA, wD, wU, wC, lam) in WEIGHT_PRESETS.items():
+        # Build a per-preset ICMConfig inheriting non-weight settings
+        preset_cfg = ICMConfig(
+            w_A=wA,
+            w_D=wD,
+            w_U=wU,
+            w_C=wC,
+            lam=lam,
+            logistic_scale=config.logistic_scale,
+            logistic_shift=config.logistic_shift,
+            C_A_mode=config.C_A_mode,
+            C_A_adaptive_percentile=config.C_A_adaptive_percentile,
+            direction_mode=config.direction_mode,
+            perturbation_scale=config.perturbation_scale,
+            aggregation=config.aggregation,
+        )
+
+        # Per-sample ICM scores
+        scores = _compute_per_sample_icm_classification(preds_test, preset_cfg)
+        preset_scores[preset_name] = scores
+
+        mean_icm = float(np.mean(scores))
+        score_range = float(np.max(scores) - np.min(scores))
+        act_rate = float(np.sum(scores >= tau_hi) / n_samples) if n_samples > 0 else 0.0
+
+        # ICM-Weighted accuracy: weight models by per-model ICM,
+        # get weighted ensemble predictions, then compute accuracy.
+        per_model_icm = _compute_per_model_icm_classification(
+            preds_test, preset_cfg,
+        )
+        weighted_pred = _icm_weighted_ensemble_classification(
+            preds_test, per_model_icm,
+        )
+        if weighted_pred.ndim == 1:
+            weighted_pred = np.column_stack([1.0 - weighted_pred, weighted_pred])
+        weighted_class = np.argmax(weighted_pred, axis=1)
+        acc = float(np.mean(weighted_class == y_test_int))
+
+        mean_scores.append(mean_icm)
+        accuracies.append(acc)
+
+        results_rows.append({
+            "Preset": preset_name,
+            "w_A": wA,
+            "w_D": wD,
+            "w_U": wU,
+            "w_C": wC,
+            "lam": lam,
+            "Mean ICM": mean_icm,
+            "Score Range": score_range,
+            "ICM-Weighted Acc": acc,
+            "ACT Rate": act_rate,
+        })
+
+    # Stability metrics ------------------------------------------------
+    mean_arr = np.array(mean_scores)
+    acc_arr = np.array(accuracies)
+
+    cv_mean_icm = float(np.std(mean_arr) / (np.mean(mean_arr) + 1e-12))
+    acc_range = float(np.max(acc_arr) - np.min(acc_arr))
+    acc_std = float(np.std(acc_arr))
+
+    stability = {
+        "cv_mean_icm": cv_mean_icm,
+        "accuracy_range": acc_range,
+        "accuracy_std": acc_std,
+        "mean_icm_std": float(np.std(mean_arr)),
+        "mean_icm_mean": float(np.mean(mean_arr)),
+        "n_presets": len(WEIGHT_PRESETS),
+    }
+
+    return {
+        "results_table": pd.DataFrame(results_rows),
+        "stability": stability,
+        "preset_scores": preset_scores,
+        "skip_reason": None,
+    }
+
+
 # Main Benchmark Runner
 # ============================================================
 
@@ -1867,6 +2057,17 @@ def run_soa_benchmark(seed: int = 42, verbose: bool = True) -> dict:
             print(exp8["results_table"].to_string(index=False))
             print()
 
+        # Experiment 9 (Weight Sensitivity Analysis)
+        exp9 = experiment_weight_sensitivity(
+            ds_name, X_train, X_test, y_train, y_test,
+            task="classification", seed=seed, config=config,
+            _preds_test=preds_test,
+        )
+        if verbose:
+            print("  Exp 9 (Weight Sensitivity):")
+            print(exp9["results_table"].to_string(index=False))
+            print()
+
         dataset_results[ds_name] = {
             "info": info,
             "exp1_prediction_quality": exp1,
@@ -1877,6 +2078,7 @@ def run_soa_benchmark(seed: int = 42, verbose: bool = True) -> dict:
             "exp6_ablation": exp6,
             "exp7_dependency_penalty": exp7,
             "exp8_gating_comparison": exp8,
+            "exp9_weight_sensitivity": exp9,
         }
 
     # ------------------------------------------------------------------
@@ -1958,6 +2160,7 @@ def _compute_aggregate_results(
         "exp3_corr_entropy": [],
         "exp3_corr_bootstrap": [],
         "exp5_wide_range_improvement": [],
+        "exp9_weight_sensitivity": [],
     }
 
     for ds_name in clf_datasets:
@@ -2032,6 +2235,17 @@ def _compute_aggregate_results(
                     "wide_range": w_range,
                     "improvement_factor": improvement,
                 })
+
+        # Exp 9: weight sensitivity
+        exp9 = ds.get("exp9_weight_sensitivity", {})
+        stability = exp9.get("stability", {})
+        if stability:
+            agg["exp9_weight_sensitivity"].append({
+                "dataset": ds_name,
+                "cv_mean_icm": stability.get("cv_mean_icm", np.nan),
+                "accuracy_range": stability.get("accuracy_range", np.nan),
+                "accuracy_std": stability.get("accuracy_std", np.nan),
+            })
 
     return agg
 
@@ -2150,6 +2364,17 @@ def _build_summary(
             lines.append(f"[Exp 5] Score Range Analysis:")
             lines.append(f"  Wide-range preset improves score range by {np.mean(factors):.1f}x on average.")
             lines.append("")
+
+    # Exp 9 summary
+    ws = aggregate.get("exp9_weight_sensitivity", [])
+    if ws:
+        mean_cv = np.mean([r["cv_mean_icm"] for r in ws])
+        mean_acc_range = np.mean([r["accuracy_range"] for r in ws])
+        lines.append(f"[Exp 9] Weight Sensitivity Analysis:")
+        lines.append(f"  Mean CV of ICM scores across presets: {mean_cv:.4f}")
+        lines.append(f"  Mean accuracy range across presets: {mean_acc_range:.4f}")
+        lines.append(f"  Framework is {'robust' if mean_acc_range < 0.10 else 'sensitive'} to weight perturbations.")
+        lines.append("")
 
     # ICM analysis
     comps = icm_analysis.get("mean_icm_components", {})
@@ -2715,6 +2940,16 @@ def _run_single_fold_classification(
         print(exp8["results_table"].to_string(index=False))
         print()
 
+    exp9 = experiment_weight_sensitivity(
+        ds_name, X_train, X_test, y_train, y_test,
+        task="classification", seed=seed, config=config,
+        _preds_test=preds_test,
+    )
+    if verbose and fold_i == 0:
+        print("  Exp 9 (Weight Sensitivity):")
+        print(exp9["results_table"].to_string(index=False))
+        print()
+
     return {
         "info": info,
         "exp1_prediction_quality": exp1,
@@ -2725,6 +2960,7 @@ def _run_single_fold_classification(
         "exp6_ablation": exp6,
         "exp7_dependency_penalty": exp7,
         "exp8_gating_comparison": exp8,
+        "exp9_weight_sensitivity": exp9,
     }
 
 

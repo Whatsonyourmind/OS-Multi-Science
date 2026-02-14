@@ -74,7 +74,7 @@
 % ABSTRACT
 % ============================================================
 \begin{abstract}
-When multiple models---spanning statistical methods, machine learning, and simulation---are applied to the same prediction task, practitioners face a fundamental question: do these models \emph{truly} agree, or is their apparent consensus an artifact of shared biases, correlated training data, or saturated metrics? Existing ensemble diversity measures such as the Q-statistic, pairwise disagreement, and predictive entropy each capture only a single facet of inter-model agreement and offer no mechanism to distinguish genuine from spurious convergence. We introduce the \emph{Index of Convergence Multi-epistemic} (ICM), a five-component diagnostic score that aggregates distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded value in $(0,1)$ via logistic aggregation. We prove that the ICM is bounded, monotone in each positive component, and Lipschitz continuous with constant $L_{\icm} = (\text{scale}/4)\sqrt{w_A^2 + w_D^2 + w_U^2 + w_C^2 + \lambda^2}$ ($L \approx 0.12$ default; $L \approx 1.22$ wide-range). We couple ICM with a conformal risk control (CRC) gating mechanism that provides distribution-free coverage guarantees and partitions predictions into ACT, DEFER, and AUDIT decisions. Experiments on eleven datasets (nine classification, two regression) with eight diverse model families plus a deep ensemble baseline, evaluated via stratified 5-fold cross-validation, show that ICM-weighted predictions achieve competitive accuracy (mean $0.953 \pm 0.03$ across classification tasks), the ICM-CRC system provides valid conformal coverage (mean 0.984) with tight prediction sets (mean size 1.40), and ICM-based error detection matches entropy baselines (Spearman $\rho = 0.184$ vs.\ $0.178$). The wide-range preset expands the effective score range by $16.1\times$ over default logistic aggregation, enabling meaningful three-way decision gating. Crucially, ICM automatically calibrates ACT rates to problem difficulty---from 83\% on easy datasets to 14\% on a 40-class face recognition task---with all five components varying meaningfully across the evaluation suite ($A{=}0.450$, $D{=}0.765$, $U{=}0.793$, $C{=}0.920$). Ablation analysis confirms that every component contributes: removing distributional agreement alone drops the mean score from 0.849 to 0.365, while the full five-component ICM outperforms entropy-only gating (0.849 vs.\ 0.312). When residual correlation data is provided, the dependency penalty activates meaningfully ($\Pi{=}0.52$ for diverse models, $0.63$ for correlated ensembles), correctly penalizing spurious convergence. The primary value of ICM is not in surpassing baselines on raw accuracy, but in providing a decomposable, formally grounded diagnostic signal that reveals \emph{when} and \emph{why} an ensemble's output should be trusted.
+When multiple models---spanning statistical methods, machine learning, and simulation---are applied to the same prediction task, practitioners face a recurring question: do these models agree because of independent evidence, or is their apparent consensus an artifact of shared biases or correlated training data? Existing ensemble diversity measures each capture only a single facet of inter-model agreement and offer no mechanism to distinguish genuine from spurious convergence. We introduce the \emph{Index of Convergence Multi-epistemic} (ICM), a five-component diagnostic score that aggregates distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and a dependency penalty into a single bounded value in $(0,1)$ via logistic aggregation. We prove that ICM is bounded, monotone, and Lipschitz continuous, and couple it with a conformal risk control (CRC) gating mechanism that provides distribution-free coverage guarantees, partitioning predictions into ACT, DEFER, and AUDIT decisions. Experiments on eleven datasets with eight model families plus a deep ensemble baseline, evaluated via stratified 5-fold cross-validation, show that ICM-weighted predictions achieve competitive accuracy (mean $0.953 \pm 0.03$), valid conformal coverage (mean 0.984), and error detection comparable to entropy baselines (Spearman $\rho = 0.184$ vs.\ $0.178$). A wide-range preset expands the effective score range by $16.1\times$, enabling three-way decision gating with ACT rates that automatically calibrate from 14\% on a 40-class face recognition task to 83\% on easy datasets. Ablation analysis confirms that every component contributes, and the framework is robust across weight presets. The value of ICM lies not in surpassing baselines on raw accuracy, but in providing a decomposable, formally grounded diagnostic signal that reveals \emph{when} and \emph{why} an ensemble's output should be trusted.
 \end{abstract}
 
 % ============================================================
@@ -89,9 +89,10 @@ The answer depends critically on the nature of inter-model agreement. If all mod
 
 \begin{itemize}
     \item \textbf{Pairwise disagreement and Q-statistic}~\citep{kuncheva2003measures}: Measure label-level agreement but ignore distributional structure, uncertainty calibration, and model dependencies.
-    \item \textbf{Predictive entropy}~\citep{lakshminarayanan2017simple}: Captures spread in the predictive distribution but conflates aleatoric and epistemic uncertainty and provides no dependency correction.
+    \item \textbf{Predictive entropy}~\citep{lakshminarayanan2017simple}: Captures spread in the predictive distribution but conflates aleatoric and epistemic uncertainty~\citep{depeweg2018decomposition} and provides no dependency correction.
     \item \textbf{Cohen's $\kappa$ and Fleiss' $\kappa$}~\citep{cohen1960coefficient,fleiss1971measuring}: Designed for discrete ratings with chance correction, but cannot handle continuous distributions or heterogeneous output types.
     \item \textbf{Deep ensemble disagreement}~\citep{lakshminarayanan2017simple,gal2016dropout}: Quantifies within-family uncertainty (e.g., neural networks with different seeds) but does not address cross-paradigm convergence.
+    \item \textbf{Selective prediction}~\citep{geifman2017selective,elyanov2010foundations}: Learns when to abstain from prediction based on model confidence, providing a principled reject option. ICM's three-way ACT/DEFER/AUDIT gate generalizes this to multi-model convergence with conformal coverage guarantees.
 \end{itemize}
 
 \paragraph{Contributions.} We propose the Index of Convergence Multi-epistemic (ICM), a unified framework that addresses these limitations through five contributions:
@@ -100,8 +101,8 @@ The answer depends critically on the nature of inter-model agreement. If all mod
     \item A \textbf{five-component convergence score} $\icm = \sigma(w_A A + w_D D + w_U U + w_C C - \lambda \Pi)$ that decomposes ensemble agreement into distributional agreement ($A$), directional consensus ($D$), uncertainty overlap ($U$), perturbation invariance ($C$), and a dependency penalty ($\Pi$), each formally defined on $[0,1]$.
     \item \textbf{Formal guarantees}: boundedness (Proposition~\ref{prop:bounded}), monotonicity in each positive component (Proposition~\ref{prop:monotone}), and Lipschitz continuity with constant $L = (\text{scale}/4)\|\bw^*\|$ (Proposition~\ref{prop:lipschitz}).
     \item A \textbf{conformal risk control (CRC) gating} mechanism that maps ICM scores to calibrated risk bounds with distribution-free coverage guarantees, partitioning predictions into ACT/DEFER/AUDIT decisions (Theorem~\ref{thm:coverage}).
-    \item \textbf{Anti-saturation mechanisms}---adaptive normalization, argmax-based direction, and perturbation scaling---that expand the effective score range by $16.1\times$, enabling practical decision gating.
-    \item \textbf{Comprehensive benchmarking} on eleven datasets (nine classification, two regression) with eight model families plus a deep ensemble baseline, including ablation studies, dependency penalty activation, and gating comparisons against simpler uncertainty methods.
+    \item \textbf{Anti-saturation mechanisms}---adaptive normalization, argmax-based direction, and perturbation scaling---that expand the effective score range substantially, enabling practical decision gating.
+    \item \textbf{Comprehensive benchmarking} on eleven datasets (nine classification, two regression) with eight model families plus a deep ensemble baseline, including ablation studies, dependency penalty activation, gating comparisons against simpler uncertainty methods, and weight sensitivity analysis.
 \end{enumerate}
 
 \paragraph{Paper roadmap.} Section~\ref{sec:related} surveys related work. Section~\ref{sec:framework} formally defines the ICM framework and its properties. Section~\ref{sec:crc} presents the CRC gating system. Section~\ref{sec:experiments} describes the experimental setup, Section~\ref{sec:results} reports results, Section~\ref{sec:discussion} discusses findings and limitations, and Section~\ref{sec:conclusion} concludes.
@@ -113,7 +114,7 @@ The answer depends critically on the nature of inter-model agreement. If all mod
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{Ensemble diversity metrics.} The taxonomy of diversity measures for classifier ensembles was systematized by \citet{kuncheva2003measures}, who analyzed ten pairwise and non-pairwise measures including the Q-statistic, disagreement measure, correlation coefficient, and double-fault measure. \citet{dietterich2000ensemble} provided foundational arguments for why ensembles work, emphasizing the statistical, computational, and representational advantages of combining models. These measures operate on binary predictions and do not extend naturally to probabilistic outputs or continuous distributions.
+\paragraph{Ensemble diversity metrics.} The taxonomy of diversity measures for classifier ensembles was systematized by \citet{kuncheva2003measures}, who analyzed ten pairwise and non-pairwise measures including the Q-statistic, disagreement measure, correlation coefficient, and double-fault measure. \citet{dietterich2000ensemble} provided foundational arguments for why ensembles work, emphasizing the statistical, computational, and representational advantages of combining models. Vote entropy and query-by-committee strategies~\citep{settles2009active} use committee disagreement to guide data acquisition, but do not decompose the structure of that disagreement. These measures operate on binary predictions and do not extend naturally to probabilistic outputs or continuous distributions.
 
 \paragraph{Diversity decompositions.} \citet{krogh1994neural} established the ambiguity decomposition linking ensemble diversity to generalization. \citet{brown2005managing} extended this with information-theoretic decompositions for regression. These works decompose ensemble \emph{error}, whereas ICM decomposes ensemble \emph{agreement}---a related but distinct quantity.
 
@@ -125,11 +126,13 @@ The answer depends critically on the nature of inter-model agreement. If all mod
 
 \paragraph{Uncertainty quantification.} Deep ensembles~\citep{lakshminarayanan2017simple} and MC Dropout~\citep{gal2016dropout} provide uncertainty estimates within a single model family. \citet{wilson2020bayesian} advocated for Bayesian perspectives on generalization. \citet{ovadia2019can} showed that uncertainty estimates degrade under dataset shift. These methods address within-family epistemic uncertainty; ICM addresses \emph{cross-family} convergence, which is a qualitatively different signal.
 
-\paragraph{Epistemic vs.\ aleatoric decomposition.} \citet{kendall2017uncertainties} decomposed predictive uncertainty into aleatoric (data noise) and epistemic (model uncertainty) components, showing their distinct roles in Bayesian deep learning. ICM's multi-component decomposition is philosophically aligned but operates at the \emph{inter-model} level rather than within a single model's posterior.
+\paragraph{Epistemic vs.\ aleatoric decomposition.} \citet{kendall2017uncertainties} decomposed predictive uncertainty into aleatoric (data noise) and epistemic (model uncertainty) components, showing their distinct roles in Bayesian deep learning. \citet{depeweg2018decomposition} formalized this decomposition in Bayesian deep learning for risk-sensitive decision-making. ICM's multi-component decomposition is philosophically aligned but operates at the \emph{inter-model} level rather than within a single model's posterior.
 
 \paragraph{Statistical dependence testing.} The Hilbert-Schmidt Independence Criterion (HSIC)~\citep{gretton2012kernel} is a kernel-based test for statistical independence that we use in the dependency penalty and anti-spurious protocol. The Ledoit-Wolf shrinkage estimator~\citep{ledoit2004well} provides well-conditioned correlation estimates when the number of models may be comparable to the number of observations.
 
-\paragraph{Selective prediction and learning to defer.} The three-way decision gate relates to the classical reject option~\citep{chow1970optimum} and the selective prediction framework of~\citet{elyanov2010foundations}. Recent work on learning to defer~\citep{mozannar2020consistent} learns when to delegate to a human expert. Our approach differs in using an unsupervised convergence signal (ICM) rather than a supervised deferral policy, and in providing conformal coverage guarantees. The gating architecture also shares structural similarities with mixture-of-experts systems~\citep{shazeer2017outrageously}, though ICM gates at the prediction level rather than routing inputs to specialized sub-networks.
+\paragraph{Selective prediction and learning to defer.} The three-way decision gate relates to the classical reject option~\citep{chow1970optimum} and the selective prediction framework of~\citet{elyanov2010foundations}. Recent work on learning to defer~\citep{mozannar2020consistent} learns when to delegate to a human expert. Our approach differs in using an unsupervised convergence signal (ICM) rather than a supervised deferral policy, and in providing conformal coverage guarantees. The gating architecture also shares structural similarities with mixture-of-experts systems~\citep{jacobs1991adaptive,shazeer2017outrageously}, though ICM gates at the prediction level rather than routing inputs to specialized sub-networks.
+
+\paragraph{Why five components?} The five ICM components were chosen to span the key orthogonal dimensions of ensemble agreement: distributional overlap ($A$), prediction direction ($D$), uncertainty calibration ($U$), stability ($C$), and independence ($\Pi$). Together they capture what no single metric can: the agreement component measures \emph{if} models agree, the direction component measures \emph{where} they agree, the uncertainty component measures \emph{how confidently} they agree, the invariance component measures \emph{how stably} they agree, and the dependency component measures \emph{whether} that agreement is genuine.
 
 
 % ============================================================
@@ -182,7 +185,7 @@ U(\cF) = \frac{2}{K(K{-}1)}\sum_{i < j} \frac{\max(\min(u_i, u_j) - \max(l_i, l_
 \end{definition}
 
 \begin{definition}[Perturbation Invariance $C$]\label{def:invariance}
-Given pre-perturbation predictions $\hat{y}^{\mathrm{pre}}$ and post-perturbation predictions $\hat{y}^{\mathrm{post}}$:
+Motivated by the observation that small input perturbations can dramatically change neural network predictions~\citep{szegedy2014intriguing}, we measure ensemble stability under noise. Given pre-perturbation predictions $\hat{y}^{\mathrm{pre}}$ and post-perturbation predictions $\hat{y}^{\mathrm{post}}$:
 \begin{equation}
 C(\cF) = 1 - \min\!\left(\frac{\|\hat{y}^{\mathrm{pre}} - \hat{y}^{\mathrm{post}}\|}{\|\hat{y}^{\mathrm{pre}}\| + \epsilon},\; 1\right)
 \end{equation}
@@ -388,7 +391,7 @@ All results are reported using \textbf{stratified 5-fold cross-validation} (clas
 
 For Experiment~2 (uncertainty quantification), both ICM-CRC and split conformal prediction are evaluated on the \emph{same} held-out evaluation subset within each fold---a randomly selected half of the test fold is used for calibration and the other half for evaluation---ensuring a fair comparison.
 
-We conduct eight experiments:
+We conduct nine experiments:
 
 \paragraph{Exp 1: Prediction quality.} Compare ICM-weighted predictions (where each model's contribution is proportional to its per-sample ICM score) against all baselines on accuracy, log loss, and Brier score.
 
@@ -405,6 +408,8 @@ We conduct eight experiments:
 \paragraph{Exp 7: Dependency penalty activation.} Demonstrate the effect of $\Pi > 0$ by providing residual correlations from training data to the dependency penalty. Compare three scenarios: diverse ensemble without dependency data, diverse ensemble with dependency data, and a deliberately correlated ensemble (multiple random forests) with dependency data.
 
 \paragraph{Exp 8: Gating comparison.} Compare ICM-based three-way gating against simpler alternatives: entropy-only thresholding, max-probability confidence, and entropy$+$disagreement combination. Report ACT rate, ACT accuracy (precision of the ``trust'' decision), AUDIT rate, and gating quality.
+
+\paragraph{Exp 9: Weight sensitivity.} Sweep component weights across seven presets (default, equal, four single-component-dominant, and penalty-heavy) to assess robustness. Report accuracy, score range, and ACT rate stability.
 
 
 % ============================================================
@@ -436,7 +441,7 @@ Deep Ensemble      & 0.833 & \textbf{1.000} & 0.956 & \textbf{0.986} & 0.980 & 0
 \end{tabular}
 \end{table}
 
-Under 5-fold cross-validation, ICM-Weighted predictions achieve a mean accuracy of $0.953 \pm 0.03$ across all nine classification tasks, compared to 0.964 for the best baseline per dataset. ICM-Weighted is the top method on 2 of 9 classification datasets (including ties). The Deep Ensemble baseline uses five architecturally diverse MLPs with varied hidden layer sizes, activation functions, and learning rates to maximize disagreement-based diversity. On the most challenging dataset (Covertype, 7 classes, 54 features), all methods struggle: ICM-Weighted achieves 0.750 vs.\ 0.755 for the best baseline. On Olivetti Faces (40 classes), ICM-Weighted achieves 0.888, while the Deep Ensemble achieves 0.938 due to its architectural diversity. On the synthetic Moons and Circles datasets, most methods achieve near-perfect accuracy ($\geq 0.985$), confirming that the model zoo handles nonlinear boundaries well.
+Under 5-fold cross-validation, ICM-Weighted predictions are competitive with baselines across all nine classification tasks (Table~\ref{tab:prediction}). ICM-Weighted is the top method on 2 of 9 classification datasets (including ties). The Deep Ensemble baseline uses five architecturally diverse MLPs with varied hidden layer sizes, activation functions, and learning rates to maximize disagreement-based diversity. On the most challenging dataset (Covertype, 7 classes, 54 features), all methods struggle: ICM-Weighted achieves 0.750 vs.\ 0.755 for the best baseline. On Olivetti Faces (40 classes), ICM-Weighted achieves 0.888, while the Deep Ensemble achieves 0.938 due to its architectural diversity. On the synthetic Moons and Circles datasets, most methods achieve near-perfect accuracy ($\geq 0.985$), confirming that the model zoo handles nonlinear boundaries well.
 
 For regression under 5-fold CV, ICM-Weighted achieves RMSE $0.531 \pm 0.016$ on California Housing (vs.\ $0.571 \pm 0.017$ for ensemble average) and RMSE $58.0 \pm 5.6$ on Diabetes (vs.\ $55.7 \pm 3.4$ for ensemble average), showing mixed results.
 
@@ -491,7 +496,7 @@ Table~\ref{tab:error} shows that ICM-based error detection (using inverted ICM s
 
 \begin{table}[t]
 \centering
-\caption{Mean ICM components across all nine classification datasets (wide-range preset). All components vary meaningfully---none are saturated at 0 or 1. Olivetti Faces (40 classes) shows strikingly low agreement ($A{=}0.245$) and uncertainty overlap ($U{=}0.275$), driving its low overall ICM score.}
+\caption{Mean ICM components across all nine classification datasets (wide-range preset). All components vary across datasets---none are saturated at 0 or 1. Olivetti Faces (40 classes) shows low agreement ($A{=}0.245$) and uncertainty overlap ($U{=}0.275$), driving its low overall ICM score.}
 \label{tab:components}
 \begin{tabular}{lcccccc}
 \toprule
@@ -512,7 +517,7 @@ Wine           & 0.478 & 0.864 & 0.887 & 0.922 & 0.000 & 0.752 \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:components} reveals that all four positive components vary meaningfully across datasets. Agreement ($A$) ranges from 0.265 (Olivetti Faces) to 0.619 (Iris), reflecting genuine differences in how well eight diverse model families agree across datasets of varying difficulty. Directional consensus ($D$) ranges from 0.513 (Olivetti, 40 classes) to 0.927 (Wine, clean 3-class boundary). Uncertainty overlap ($U$) shows the widest variation: from 0.228 (Olivetti) to 0.985 (Moons). Invariance ($C$) is consistently high (0.903--0.932), indicating stable predictions under small perturbations across all datasets. The dependency penalty $\Pi = 0$ across all datasets because the benchmark uses genuinely independent model families trained on the same features---without residual correlation or gradient similarity information provided.
+Table~\ref{tab:components} shows that all four positive components vary across datasets. Agreement ($A$) ranges from 0.265 (Olivetti Faces) to 0.619 (Iris), reflecting genuine differences in how well eight diverse model families agree across datasets of varying difficulty. Directional consensus ($D$) ranges from 0.513 (Olivetti, 40 classes) to 0.927 (Wine, clean 3-class boundary). Uncertainty overlap ($U$) shows the widest variation: from 0.228 (Olivetti) to 0.985 (Moons). Invariance ($C$) is consistently high (0.903--0.932), indicating stable predictions under small perturbations across all datasets. The dependency penalty $\Pi = 0$ across all datasets because the benchmark uses genuinely independent model families trained on the same features---without residual correlation or gradient similarity information provided.
 
 Compared to standard diversity metrics, ICM provides a richer picture: while the Q-statistic ranges from $-0.26$ to $0.97$ across datasets (a sign-unstable measure), the ICM decomposes agreement into four interpretable dimensions that each tell a distinct part of the story.
 
@@ -541,7 +546,7 @@ Dataset & Config & Mean & Std & Min & Max & Range \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:range} demonstrates the critical importance of the anti-saturation mechanisms. The default logistic configuration compresses all scores into a narrow band of width $0.022$--$0.081$ (mean range $0.051$), making three-way decision gating impractical. The wide-range preset expands the range to $0.566$--$0.921$ (mean range $0.781$), a $16.1\times$ improvement on average that enables meaningful ACT/DEFER/AUDIT partitioning.
+Table~\ref{tab:range} illustrates the importance of the anti-saturation mechanisms. The default logistic configuration compresses all scores into a narrow band of width $0.022$--$0.081$ (mean range $0.051$), making three-way decision gating impractical. The wide-range preset expands the range to $0.566$--$0.921$ (mean range $0.781$), enabling ACT/DEFER/AUDIT partitioning.
 
 \subsection{Decision Gate Breakdown}
 
@@ -568,7 +573,7 @@ Iris           & 3  & 93.3\% & 6.7\%  & 0.0\%  \\
 \end{tabular}
 \end{table}
 
-The decision gate breakdown reveals the \textbf{key finding} of the expanded evaluation: ICM automatically calibrates ACT rates to problem difficulty without any dataset-specific tuning. Easy datasets with clean boundaries (Iris, Wine, Breast Cancer) receive 84--93\% ACT rates. Moderately difficult tasks (Digits with 10 classes, Covertype with 7 classes and 54 features) receive 40--70\% ACT rates with substantial DEFER allocations. The hardest task---Olivetti Faces with 40 classes and only 10 samples per class---receives just 14\% ACT with 41\% AUDIT, correctly reflecting that the ensemble has low confidence on most predictions. This difficulty-calibrated gating emerges automatically from the five-component decomposition: low agreement ($A{=}0.265$), low directional consensus ($D{=}0.513$), and low uncertainty overlap ($U{=}0.228$) on Olivetti Faces jointly drive the ICM score down, whereas high values on all three components for easy datasets drive scores up. No single uncertainty metric (entropy, disagreement, or max-probability) captures this multi-faceted difficulty calibration.
+The decision gate breakdown shows that ICM automatically calibrates ACT rates to problem difficulty without any dataset-specific tuning. Easy datasets with clean boundaries (Iris, Wine, Breast Cancer) receive 84--93\% ACT rates. Moderately difficult tasks (Digits with 10 classes, Covertype with 7 classes and 54 features) receive 40--70\% ACT rates with substantial DEFER allocations. The hardest task---Olivetti Faces with 40 classes and only 10 samples per class---receives just 14\% ACT with 41\% AUDIT, correctly reflecting that the ensemble has low confidence on most predictions. This difficulty-calibrated gating emerges automatically from the five-component decomposition: low agreement ($A{=}0.265$), low directional consensus ($D{=}0.513$), and low uncertainty overlap ($U{=}0.228$) on Olivetti Faces jointly drive the ICM score down, whereas high values on all three components for easy datasets drive scores up. No single uncertainty metric (entropy, disagreement, or max-probability) captures this multi-faceted difficulty calibration.
 
 
 \subsection{Ablation Study (Exp 6)}
@@ -613,7 +618,7 @@ Correlated ensemble (with $\Pi$) & 0.352 & 0.632 \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:dependency} addresses a key limitation noted in Section~\ref{sec:discussion}: when residual correlation data is provided, the dependency penalty activates meaningfully. Even with diverse model families, residual correlations from shared training data yield $\Pi \approx 0.52$, reducing the ICM score from 0.635 to 0.473. When we deliberately construct a correlated ensemble (multiple random forests with different seeds), $\Pi$ increases to 0.63 and the ICM score drops to 0.352, correctly reflecting reduced epistemic diversity. This demonstrates that ICM's dependency penalty distinguishes genuine from spurious convergence when the necessary information is available.
+Table~\ref{tab:dependency} addresses a limitation noted in Section~\ref{sec:discussion}: when residual correlation data is provided, the dependency penalty activates. Even with diverse model families, residual correlations from shared training data yield $\Pi \approx 0.52$, reducing the ICM score from 0.635 to 0.473. When we deliberately construct a correlated ensemble (multiple random forests with different seeds), $\Pi$ increases to 0.63 and the ICM score drops to 0.352, correctly reflecting reduced epistemic diversity. This demonstrates that ICM's dependency penalty distinguishes genuine from spurious convergence when the necessary information is available.
 
 \subsection{Gating Comparison (Exp 8)}
 
@@ -633,7 +638,32 @@ Entropy + Disagreement  & 79.8 & 0.976 & 2.9 \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:gating} compares ICM-based gating against simpler alternatives. The key finding is that ICM provides a fundamentally different operating point: it routes 61.7\% of predictions to ACT with 98.1\% accuracy while flagging 11.9\% for AUDIT. Entropy-only gating is more conservative (40.4\% ACT, perfect accuracy, 8.2\% AUDIT), while max-probability confidence is more aggressive (76.9\% ACT, 98.6\% accuracy, only 1.9\% AUDIT). The ICM's AUDIT rate of 11.9\%---substantially higher than the alternatives---reflects its multi-dimensional assessment: samples flagged for AUDIT have low agreement, fragmented direction, \emph{and} poor uncertainty overlap, making them genuinely uncertain rather than merely having low entropy. This higher AUDIT rate is a feature, not a bug: in safety-critical settings, identifying the samples that warrant human review is as important as automating confident predictions.
+Table~\ref{tab:gating} compares ICM-based gating against simpler alternatives. ICM provides a different operating point: it routes 61.7\% of predictions to ACT with 98.1\% accuracy while flagging 11.9\% for AUDIT. Entropy-only gating is more conservative (40.4\% ACT, perfect accuracy, 8.2\% AUDIT), while max-probability confidence is more aggressive (76.9\% ACT, 98.6\% accuracy, only 1.9\% AUDIT). The ICM's AUDIT rate of 11.9\%---substantially higher than the alternatives---reflects its multi-dimensional assessment: samples flagged for AUDIT have low agreement, fragmented direction, \emph{and} poor uncertainty overlap, making them genuinely uncertain rather than merely having low entropy. This higher AUDIT rate is a feature, not a bug: in safety-critical settings, identifying the samples that warrant human review is as important as automating confident predictions.
+
+\subsection{Weight Sensitivity (Exp 9)}
+
+To assess whether ICM's diagnostic value depends critically on a specific weight configuration, we sweep across seven weight presets spanning a broad region of the weight simplex, including four single-component-dominant configurations.
+
+\begin{table}[t]
+\centering
+\caption{Weight sensitivity analysis across seven presets. Accuracy, mean ICM score range, and ACT rate are averaged over nine classification datasets. Accuracy varies by less than 0.5 percentage points across all presets, confirming robustness to weight choice.}
+\label{tab:weight_sensitivity}
+\begin{tabular}{lccccc|ccc}
+\toprule
+Preset & $w_A$ & $w_D$ & $w_U$ & $w_C$ & $\lambda$ & Accuracy & Score Range & ACT\% \\
+\midrule
+Default         & 0.35 & 0.15 & 0.25 & 0.10 & 0.15 & 0.950 & 0.77 & 61.7 \\
+Equal           & 0.20 & 0.20 & 0.20 & 0.20 & 0.20 & 0.947 & 0.72 & 60.2 \\
+$A$-dominant    & 0.50 & 0.15 & 0.15 & 0.10 & 0.10 & 0.947 & 0.80 & 65.1 \\
+$D$-dominant    & 0.15 & 0.50 & 0.15 & 0.10 & 0.10 & 0.946 & 0.91 & 61.2 \\
+$U$-dominant    & 0.15 & 0.15 & 0.50 & 0.10 & 0.10 & 0.948 & 0.68 & 74.4 \\
+$C$-dominant    & 0.15 & 0.15 & 0.10 & 0.50 & 0.10 & 0.951 & 0.34 & 92.7 \\
+$\Pi$-dominant  & 0.10 & 0.10 & 0.10 & 0.10 & 0.60 & 0.947 & 0.17 & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:weight_sensitivity} shows that the framework is robust to weight selection. Across all seven presets---spanning equal weighting, single-component dominance, and heavy penalty configurations---the mean classification accuracy varies by less than 0.5 percentage points (0.946--0.951). The core presets (Default through $U$-dominant) maintain ACT rates in a 60--74\% band. The two extreme presets reveal expected boundary behavior: $C$-dominant achieves 92.7\% ACT because the invariance component $C \approx 0.92$ is near-constant across samples, while $\Pi$-dominant collapses to 0\% ACT because the heavy penalty pushes all scores below the gating threshold (in our benchmark, $\Pi = 0$ so there is nothing to offset the large $\lambda$). These extremes are informative---they confirm that the $C$ component contributes stability signal while the $\Pi$ penalty requires residual data to be useful---but the five non-extreme presets demonstrate that the framework's diagnostic value is robust to the specific weight vector chosen.
 
 
 % ============================================================
@@ -643,12 +673,12 @@ Table~\ref{tab:gating} compares ICM-based gating against simpler alternatives. T
 \label{sec:discussion}
 
 \paragraph{The diagnostic value of ICM.}
-The primary contribution of ICM is \emph{not} surpassing baselines on raw prediction accuracy---ensemble averaging and stacking are specifically designed for this purpose and unsurprisingly perform well. Rather, ICM provides a \textbf{decomposable diagnostic signal} that answers the question: \emph{why} do models agree or disagree on this prediction?
+ICM is not designed to surpass baselines on raw prediction accuracy---ensemble averaging and stacking serve that purpose. Rather, ICM provides a decomposable diagnostic signal that answers the question: \emph{why} do models agree or disagree on this prediction?
 
 Consider a sample where the ensemble average confidently predicts class 1. Without ICM, the practitioner knows only the prediction and perhaps an entropy measure. With ICM, they learn that $A = 0.35$ (moderate distributional agreement), $D = 1.0$ (all models agree on direction), $U = 0.92$ (uncertainty intervals overlap substantially), $C = 0.88$ (predictions are stable under perturbation), and $\Pi = 0.0$ (no detected dependency). This decomposition reveals that while the models agree on the direction, their distributional agreement is modest---a nuance invisible to entropy-based measures.
 
 \paragraph{Difficulty-calibrated decision gating.}
-The expanded benchmark reveals that ICM's decision gating automatically scales with problem difficulty---a property we term \emph{difficulty calibration}. On easy datasets with 2--3 classes and clean decision boundaries (Iris, Wine, Breast Cancer), the system routes 84--93\% of predictions to ACT. On moderately difficult tasks with many classes or high dimensionality (Digits, Covertype), ACT rates drop to 40--70\% with substantial DEFER allocations. On the hardest task (Olivetti Faces: 40 classes, 10 samples per class), only 14\% of predictions reach ACT while 41\% are flagged for AUDIT. This calibration emerges entirely from the five-component decomposition without any dataset-specific threshold tuning. The agreement component $A$ captures distributional spread across model families; the directional component $D$ captures class-vote fragmentation; and the uncertainty overlap $U$ captures whether models' confidence intervals align. When all three are low---as in the 40-class face recognition setting---the composite ICM score drops sharply, triggering conservative gating. No single baseline metric (entropy, disagreement, max-probability) provides this multi-dimensional difficulty signal; each captures only one facet of ensemble disagreement, making them less reliable as standalone gating criteria across tasks of varying difficulty.
+The benchmark reveals that ICM's decision gating automatically scales with problem difficulty---a property we term \emph{difficulty calibration}. As shown in Table~\ref{tab:decision}, ACT rates range from 14\% on the hardest task to 93\% on the easiest, without any dataset-specific threshold tuning. This calibration emerges from the five-component decomposition: when agreement ($A$), directional consensus ($D$), and uncertainty overlap ($U$) are jointly low, the composite ICM score drops, triggering conservative gating. No single baseline metric provides this multi-dimensional difficulty signal.
 
 \paragraph{When ICM adds value.}
 ICM is most valuable in settings where:
@@ -660,16 +690,16 @@ ICM is most valuable in settings where:
 \end{itemize}
 
 \paragraph{Limitations.}
-We identify six key limitations:
+We identify six limitations:
 
 \begin{enumerate}
-    \item \textbf{Component weights are domain-dependent.} The default weights ($w_A = 0.35$, $w_D = 0.15$, $w_U = 0.25$, $w_C = 0.10$, $\lambda = 0.15$) were set based on domain knowledge, not learned from data. A sensitivity analysis shows that perturbing any weight by $\pm 50\%$ changes the mean ICM score by 0.07--0.23 across datasets, with normalized sensitivities in the range 0.5--1.5 for all four positive components---indicating that no single component dominates disproportionately and the weight vector is reasonably balanced. Our meta-learner framework can optimize these weights, but optimal weights may differ across application domains.
+    \item \textbf{Component weights are domain-dependent.} The default weights ($w_A = 0.35$, $w_D = 0.15$, $w_U = 0.25$, $w_C = 0.10$, $\lambda = 0.15$) were set based on domain knowledge, not learned from data. A sensitivity analysis shows that perturbing any weight by $\pm 50\%$ changes the mean ICM score by 0.07--0.23 across datasets, with normalized sensitivities in the range 0.5--1.5 for all four positive components---indicating that no single component dominates disproportionately and the weight vector is reasonably balanced. Experiment~9 (Table~\ref{tab:weight_sensitivity}) further confirms this robustness: sweeping across seven structurally different weight presets changes accuracy by less than 0.5~pp. Our meta-learner framework can optimize these weights, but optimal weights may differ across application domains.
 
     \item \textbf{Standard ML benchmarks.} Although the expanded benchmark now covers eleven datasets including synthetic nonlinear boundaries, real-world multi-class tasks, high-dimensional face recognition, and distribution shift, all experiments use standard scikit-learn model families. Future work should evaluate on domain-specific applications (climate projections, epidemic forecasting, financial risk) where models from fundamentally different scientific traditions are combined.
 
     \item \textbf{Dependency penalty activation.} In our primary benchmarks, $\Pi = 0$ because the model zoo uses independent families without providing residual information. Experiment~7 demonstrates that when residual correlations are provided, $\Pi$ activates meaningfully ($\Pi \approx 0.52$ for diverse models, $\Pi \approx 0.63$ for correlated ensembles). Full activation with gradient attributions and feature provenance metadata, available in production settings, would provide even stronger dependency detection.
 
-    \item \textbf{Invariance component near-constant.} The perturbation invariance $C$ shows low variance across datasets (0.903--0.932), indicating it provides limited discriminative signal in our benchmark. This is because all models in our zoo produce stable predictions under small input perturbations on tabular data. In domains with adversarially sensitive models or high-dimensional inputs (e.g., images, text), we expect $C$ to vary more meaningfully and contribute greater diagnostic value.
+    \item \textbf{Invariance component near-constant.} The perturbation invariance $C$ shows low variance across datasets (0.903--0.932), indicating it provides limited discriminative signal in our benchmark. This is because all models in our zoo produce stable predictions under small input perturbations on tabular data. In domains with adversarially sensitive models or high-dimensional inputs (e.g., images, text), we expect $C$ to vary more and contribute greater diagnostic value.
 
     \item \textbf{Conservative coverage.} The ICM-CRC system achieves 98.4\% coverage at a nominal 90\% target, indicating over-conservative prediction sets. This results from using a single isotonic calibration model. Adaptive or class-conditional calibration could tighten sets closer to the nominal level without sacrificing the coverage guarantee.
 
@@ -680,7 +710,7 @@ We identify six key limitations:
 ICM and BMA~\citep{hoeting1999bayesian} serve different purposes. BMA weights models by posterior probability to optimize predictive accuracy, requiring a likelihood specification. ICM diagnoses the \emph{nature} of agreement by decomposing geometric properties of model outputs, requiring no likelihood. The two are complementary: BMA could serve as the aggregation method while ICM provides the diagnostic layer that reveals \emph{why} the posterior concentrates on certain models. We do not include BMA as a prediction baseline because ICM is not designed to compete on raw accuracy; rather, it augments any aggregation method with interpretable convergence diagnostics.
 
 \paragraph{Computational cost.}
-The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ for Hellinger with $C$ classes) and the Ledoit-Wolf correlation ($O(K^2 N)$). For typical settings ($K = 3$--$8$, $C \leq 40$, $N \leq 10^4$), the total runtime is under one second on commodity hardware. The full benchmark suite (11 datasets, 8 models plus deep ensemble, 8 experiments) completes in approximately 140 seconds.
+The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ for Hellinger with $C$ classes) and the Ledoit-Wolf correlation ($O(K^2 N)$). For typical settings ($K = 3$--$8$, $C \leq 40$, $N \leq 10^4$), the total runtime is under one second on commodity hardware. The full benchmark suite (11 datasets, 8 models plus deep ensemble, 9 experiments) completes in approximately 140 seconds.
 
 
 % ============================================================
@@ -689,13 +719,13 @@ The ICM computation is dominated by pairwise distance calculations ($O(K^2 C)$ f
 \section{Conclusion}
 \label{sec:conclusion}
 
-We have presented the Index of Convergence Multi-epistemic (ICM), a five-component framework for diagnosing the nature and strength of agreement among epistemically diverse models. The ICM score is provably bounded, monotone, and Lipschitz continuous---with Lipschitz constant $L = (s/4)\|\bw^*\|$ parameterized by the scale $s$ ($L \approx 0.12$ default; $L \approx 1.22$ wide-range)---and can be converted to calibrated risk bounds via conformal risk control gating with distribution-free coverage guarantees.
+We have presented the Index of Convergence Multi-epistemic (ICM), a five-component framework for diagnosing the nature and strength of agreement among epistemically diverse models. The ICM score is provably bounded, monotone, and Lipschitz continuous, and can be converted to calibrated risk bounds via conformal risk control gating with distribution-free coverage guarantees.
 
-Our experiments on eleven datasets with stratified 5-fold cross-validation demonstrate that ICM provides a competitive weighting signal (mean accuracy $0.953 \pm 0.03$ across nine classification tasks), valid uncertainty quantification (coverage 0.984 with tight sets of size 1.40), and effective error detection (Spearman $\rho = 0.184$, comparable to entropy at 0.178). The wide-range preset expands the effective score range by $16.1\times$, enabling meaningful three-way decision gating with ACT rates that automatically calibrate from 14\% on the hardest task (40-class face recognition) to 93\% on easy tasks---a difficulty-calibrated response that emerges from the five-component decomposition.
+Experiments on eleven datasets demonstrate that ICM provides competitive accuracy (mean $0.953 \pm 0.03$), valid conformal coverage (mean 0.984), and error detection comparable to entropy baselines. The wide-range preset expands the effective score range by $16.1\times$, enabling three-way decision gating with ACT rates that automatically calibrate to problem difficulty. Ablation analysis confirms that every component contributes, and the dependency penalty correctly distinguishes genuine from spurious convergence when residual data is provided.
 
-The fundamental contribution is \emph{diagnostic}: ICM decomposes the opaque concept of ``ensemble agreement'' into five interpretable, formally grounded components---distributional agreement, directional consensus, uncertainty overlap, perturbation invariance, and dependency---each providing distinct information about why models agree or disagree. Ablation analysis confirms that every component contributes (removing $A$ alone drops the score from 0.849 to 0.365), and providing residual data activates the dependency penalty ($\Pi \approx 0.52$), correctly distinguishing genuine from spurious convergence. The expanded benchmark confirms that these components vary meaningfully ($A{=}0.450$, $D{=}0.765$, $U{=}0.793$, $C{=}0.920$) and jointly produce difficulty-calibrated gating across tasks ranging from simple 2-class problems to complex 40-class recognition. We believe this decomposition will be particularly valuable in safety-critical applications where knowing \emph{when to trust} an ensemble matters as much as the ensemble's prediction itself.
+The contribution is \emph{diagnostic}: ICM decomposes the opaque concept of ``ensemble agreement'' into five interpretable, formally grounded components, each providing distinct information about why models agree or disagree. This decomposition is particularly relevant to safety-critical applications where knowing \emph{when to trust} an ensemble matters as much as the ensemble's prediction itself.
 
-\paragraph{Future work.} Key directions include: (1) evaluation on domain-specific multi-paradigm ensembles in climate science, epidemiology, and finance; (2) conditional coverage extensions via weighted conformal prediction; (3) online ICM updates for streaming prediction settings; and (4) theoretical analysis of the relationship between ICM and Bayes risk under multi-model aggregation.
+\paragraph{Future work.} Directions include: (1) evaluation on domain-specific multi-paradigm ensembles in climate science, epidemiology, and finance; (2) conditional coverage extensions via weighted conformal prediction; (3) online ICM updates for streaming prediction settings; and (4) theoretical analysis of the relationship between ICM and Bayes risk under multi-model aggregation.
 
 
 % ============================================================
